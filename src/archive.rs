@@ -1,7 +1,8 @@
 //! Memory-only archive access. Never calls an extraction API.
 //! Limits apply to payload dictionaries, returned files, and the one-entry cache.
 //! Encoded headers are parsed by the dependency before their metadata is available:
-//! callers must set a process address-space limit before `open` for untrusted input.
+//! `open` rejects hosts without the Linux hard process ceilings in `isolation`.
+//! This is process resource containment, not a sandbox or a recoverable decoder worker.
 use sevenz_rust2::{Archive as Metadata, BlockDecoder, Password};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -168,7 +169,27 @@ fn validate_stream_layout(metadata: &Metadata) -> Result<()> {
 }
 
 impl Archive {
+    /// Opens only in an already resource-limited Linux host process.
+    /// Call `isolation::install_process_limits` explicitly in a dedicated process,
+    /// before loading untrusted input. This method never changes host limits.
     pub fn open(path: impl AsRef<Path>, password: &str, limits: Limits) -> Result<Self> {
+        crate::isolation::require_process_limits().map_err(|e| e.to_string())?;
+        Self::open_inner(path, password, limits)
+    }
+
+    // Unit fixtures test parser semantics without changing the parallel test
+    // harness's process-wide limits. This entry point does not exist in builds
+    // used by applications; integration tests exercise the guarded public API.
+    #[cfg(test)]
+    pub(crate) fn open_fixture(
+        path: impl AsRef<Path>,
+        password: &str,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::open_inner(path, password, limits)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, password: &str, limits: Limits) -> Result<Self> {
         if limits.max_file_bytes > usize::MAX as u64 || limits.max_cache_bytes > usize::MAX as u64 {
             return Err("memory limits exceed platform address size".into());
         }
@@ -341,7 +362,7 @@ impl Archive {
             self.limits.max_cache_bytes,
             self.limits.max_dictionary_bytes
         );
-        report.push_str("Solid blocks require decoding preceding bytes on cache misses; no whole-block RAM cache.\nEncoded-header allocation is guarded by the CLI process limit, not these payload limits.\n");
+        report.push_str("Solid blocks require decoding preceding bytes on cache misses; no whole-block RAM cache.\nEncoded-header allocation is guarded by the required host process limit, not these payload limits.\n");
         for (i, block) in self.metadata.blocks.iter().enumerate() {
             let dictionary_bytes: u64 = block
                 .coders
@@ -475,8 +496,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("game.7z");
         fixture(&path, &["遊戲/data.json"], true);
-        assert!(Archive::open(&path, "wrong", Limits::default()).is_err());
-        let mut archive = Archive::open(&path, "秘密🔑", Limits::default()).unwrap();
+        assert!(Archive::open_fixture(&path, "wrong", Limits::default()).is_err());
+        let mut archive = Archive::open_fixture(&path, "秘密🔑", Limits::default()).unwrap();
         assert_eq!(archive.read("遊戲/data.json").unwrap(), b"hello archive");
         assert_eq!(archive.read("遊戲/data.json").unwrap(), b"hello archive");
         assert!(archive.read("missing").is_err());
@@ -496,16 +517,16 @@ mod tests {
             ..Limits::default()
         };
         assert!(
-            Archive::open(&path, "", limits)
+            Archive::open_fixture(&path, "", limits)
                 .unwrap()
                 .read("data.json")
                 .is_err()
         );
         limits.max_dictionary_bytes = 1;
-        assert!(Archive::open(&path, "", limits).is_err());
+        assert!(Archive::open_fixture(&path, "", limits).is_err());
         limits = Limits::default();
         limits.max_entries = 0;
-        assert!(Archive::open(&path, "", limits).is_err());
+        assert!(Archive::open_fixture(&path, "", limits).is_err());
     }
     #[test]
     fn rejects_collisions_and_traversal_in_actual_archives() {
@@ -521,7 +542,7 @@ mod tests {
         {
             let path = temp.path().join(format!("{i}.7z"));
             fixture(&path, names, false);
-            assert!(Archive::open(path, "", Limits::default()).is_err());
+            assert!(Archive::open_fixture(path, "", Limits::default()).is_err());
         }
     }
     #[test]
@@ -545,7 +566,7 @@ mod tests {
             max_cache_bytes: 1,
             ..Limits::default()
         };
-        let mut archive = Archive::open(&path, "", limits).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", limits).unwrap();
         assert!(archive.metadata.is_solid);
         assert!(archive.read("big.bin").is_err());
         assert_eq!(archive.read("small.json").unwrap(), b"{}");
@@ -565,7 +586,7 @@ mod tests {
                 .push_archive_entry(entry, Some(b"target".as_slice()))
                 .unwrap();
             writer.finish().unwrap();
-            assert!(Archive::open(&path, "", Limits::default()).is_err());
+            assert!(Archive::open_fixture(&path, "", Limits::default()).is_err());
         }
     }
     #[test]
@@ -583,7 +604,7 @@ mod tests {
             )
             .unwrap();
         writer.finish().unwrap();
-        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         // Simulate a legal block-only-CRC header while keeping real compressed
         // data. Corrupt the expected block checksum: returning early would miss it.
         for entry in &mut archive.metadata.files {
@@ -599,7 +620,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("layout.7z");
         fixture(&path, &["data.json"], false);
-        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         archive.metadata.files[0].has_stream = false;
         assert!(
             validate_stream_layout(&archive.metadata)
@@ -612,13 +633,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("corrupt.7z");
         fixture(&path, &["data.json"], false);
-        let archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         let offset = 32 + archive.metadata.pack_pos();
         drop(archive);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[offset as usize] ^= 0xff;
         std::fs::write(&path, bytes).unwrap();
-        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         assert!(archive.read("data.json").is_err());
     }
     #[test]
@@ -651,7 +672,7 @@ mod tests {
             &["a/file", "a/nested/file", "a-other", "aa/file", "b/file"],
             false,
         );
-        let archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         assert_eq!(
             archive.descendant_names("a").collect::<Vec<_>>(),
             ["a/file", "a/nested/file"]
@@ -670,7 +691,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("revision.7z");
         fixture(&path, &["data.json"], false);
-        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         archive.source.seek(SeekFrom::Start(7)).unwrap();
         let revision = archive.revision_sha256().unwrap();
         let expected: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
@@ -688,7 +709,7 @@ mod tests {
             .push_archive_entry(ArchiveEntry::new_file("empty"), None::<&[u8]>)
             .unwrap();
         writer.finish().unwrap();
-        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
         assert!(!archive.metadata.files[0].has_stream);
         archive.metadata.files[0].size = 1;
         assert!(
@@ -708,19 +729,19 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
         // No writer opens the FIFO. A blocking File::open would hang this test.
         assert!(
-            Archive::open(&path, "", Limits::default())
+            Archive::open_fixture(&path, "", Limits::default())
                 .err()
                 .unwrap()
                 .contains("regular file")
         );
         assert!(
-            Archive::open(temp.path(), "", Limits::default())
+            Archive::open_fixture(temp.path(), "", Limits::default())
                 .err()
                 .unwrap()
                 .contains("regular file")
         );
         assert!(
-            Archive::open("/dev/null", "", Limits::default())
+            Archive::open_fixture("/dev/null", "", Limits::default())
                 .err()
                 .unwrap()
                 .contains("regular file")

@@ -14,32 +14,6 @@ const HELP: &str = "RPG Archive Launcher 0.1 (experimental core, no mount backen
 fn fail(s: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(s.into()).into()
 }
-#[cfg(target_os = "linux")]
-fn memory_ceiling() -> io::Result<()> {
-    // Applies before untrusted header parsing, including allocations inside dependencies.
-    // This is an address-space ceiling, not an RSS guarantee or a portable sandbox.
-    let limit = libc::rlimit {
-        rlim_cur: 512 * 1024 * 1024,
-        rlim_max: 512 * 1024 * 1024,
-    };
-    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let cpu = libc::rlimit {
-        rlim_cur: 120,
-        rlim_max: 120,
-    };
-    if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &cpu) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-#[cfg(not(target_os = "linux"))]
-fn memory_ceiling() -> io::Result<()> {
-    Err(io::Error::other(
-        "archive CLI requires Linux address-space limits in this prototype; other platforms are not validated",
-    ))
-}
 fn input_file(path: &str) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -77,7 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args[0].as_str() {
         "inspect" | "read" | "overlay-bind" | "overlay-read" | "overlay-read-at"
         | "overlay-write-at" | "overlay-truncate" | "overlay-unlink" | "overlay-rename" => {
-            memory_ceiling()?;
+            rpg_archive_launcher::isolation::install_process_limits()?;
             let mut password = String::new();
             if encrypted {
                 let mut line = Vec::new();

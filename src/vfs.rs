@@ -231,7 +231,7 @@ mod tests {
     }
     fn open(dir: &Path) -> Overlay {
         Overlay::new(
-            Archive::open(dir.join("game.7z"), "", Limits::default()).unwrap(),
+            Archive::open_fixture(dir.join("game.7z"), "", Limits::default()).unwrap(),
             Store::open(dir.join("upper.wal")).unwrap(),
         )
         .unwrap()
@@ -268,17 +268,19 @@ mod tests {
             fixture(temp.path());
             let wal = temp.path().join("upper.wal");
             let mut store = Store::open(&wal).unwrap();
-            let revision = Archive::open(temp.path().join("game.7z"), "", Limits::default())
-                .unwrap()
-                .revision_sha256()
-                .unwrap();
+            let revision =
+                Archive::open_fixture(temp.path().join("game.7z"), "", Limits::default())
+                    .unwrap()
+                    .revision_sha256()
+                    .unwrap();
             store.bind_archive(revision).unwrap();
             store.put(key, b"raw save").unwrap();
             drop(store);
             let before = fs::read(&wal).unwrap();
             assert!(
                 Overlay::new(
-                    Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+                    Archive::open_fixture(temp.path().join("game.7z"), "", Limits::default())
+                        .unwrap(),
                     Store::open(&wal).unwrap(),
                 )
                 .is_err()
@@ -297,15 +299,17 @@ mod tests {
             writer.push_archive_entry(entry, None::<&[u8]>).unwrap();
             writer.finish().unwrap();
             let mut upper = Store::open(temp.path().join("upper.wal")).unwrap();
-            let revision = Archive::open(temp.path().join("game.7z"), "", Limits::default())
-                .unwrap()
-                .revision_sha256()
-                .unwrap();
+            let revision =
+                Archive::open_fixture(temp.path().join("game.7z"), "", Limits::default())
+                    .unwrap()
+                    .revision_sha256()
+                    .unwrap();
             upper.bind_archive(revision).unwrap();
             upper.put(key, b"raw save").unwrap();
             assert!(
                 Overlay::new(
-                    Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+                    Archive::open_fixture(temp.path().join("game.7z"), "", Limits::default())
+                        .unwrap(),
                     upper,
                 )
                 .is_err()
@@ -335,7 +339,7 @@ mod tests {
             }
             writer.finish().unwrap();
             let error = Overlay::new(
-                Archive::open(replacement, "", Limits::default()).unwrap(),
+                Archive::open_fixture(replacement, "", Limits::default()).unwrap(),
                 Store::open(temp.path().join("upper.wal")).unwrap(),
             )
             .err()
@@ -367,7 +371,7 @@ mod tests {
         upper.put("save/b", b"progress").unwrap();
         let before = fs::read(temp.path().join("upper.wal")).unwrap();
         let error = Overlay::new(
-            Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+            Archive::open_fixture(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
             upper,
         )
         .err()
@@ -424,7 +428,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fixture(temp.path());
         let mut overlay = Overlay::new(
-            Archive::open(
+            Archive::open_fixture(
                 temp.path().join("game.7z"),
                 "",
                 Limits {

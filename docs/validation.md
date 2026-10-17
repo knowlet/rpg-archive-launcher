@@ -6,7 +6,7 @@ Passed locally:
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test --locked`: 50 module tests + 4 CLI integration tests
+- `cargo test --locked`: 50 module tests + 4 CLI integration tests + 1 library-isolation integration test (6 subprocess cases)
 - `cargo build --release --locked`
 - Generate a synthetic 7z, inspect it with the release CLI, read JSON bytes correctly
 
@@ -16,7 +16,7 @@ Fixtures are generated in tests from synthetic byte strings. Block-only CRC and 
 
 Official 7-Zip 26.04 interoperability subsequently passed 12 format/encryption combinations and 60 byte comparisons; see [the reproducible report](7zip-interoperability.md).
 
-Not tested: arbitrary power-loss sector damage, disk-full/fsync-failure injection, NAS disconnection, FUSE mounts, NW.js gameplay, macOS/Windows behavior, or production performance. The initial publication passed [GitHub Linux CI](https://github.com/knowlet/rpg-archive-launcher/actions/runs/39012104413) with 32 tests. The subsequent hardening below has 54 local tests; consult the PR checks for its exact remote status.
+Not tested: arbitrary power-loss sector damage, disk-full injection, NAS disconnection, FUSE mounts, NW.js gameplay, macOS/Windows behavior, or production performance. The initial publication passed [GitHub Linux CI](https://github.com/knowlet/rpg-archive-launcher/actions/runs/39012104413) with 32 tests. The subsequent hardening and library guard below have 55 local tests; consult the PR checks for its exact remote status.
 
 ## Byte-operation slice
 
@@ -26,4 +26,6 @@ The subsequent Overlay slice passed partial-write/copy-up, zero-filled holes, gr
 
 Added actual Linux fsync-error injection and poisoned-handle rejection, valid partial initial magic recovery, every torn binding-frame prefix, permission rejection without chmod, unlocked valid-WAL symlink regression, namespace-conflict replay, nonblocking FIFO/special-source rejection, an in-bounds oversized-header test, mismatched/same-path-changed archive binding, and password newline input while stdin remains open. Runtime discovery and constructor namespace checks use indexed lookups; exact prefix boundary tests cover the range queries.
 
-The one intentionally unresolved review scope is library metadata/KDF resource isolation: direct `Archive::open` callers must establish process limits for untrusted input. The Linux CLI already does so. See the explicit architecture limitation.
+The later library guard fails closed before archive I/O or metadata/KDF parsing unless finite Linux hard address-space and CPU ceilings are active. Six fresh-process cases verify the production library, including encrypted-header reading. Full host availability isolation still requires a supervised worker; the guard is not a sandbox. See the explicit architecture contract.
+
+The six-process resource-policy acceptance test requires a fresh Linux test runner inheriting unlimited hard address-space/CPU limits, so all rejection configurations can be exercised without raising limits. It fails explicitly if this prerequisite is absent; it does not silently skip cases. The current cloud runner satisfies this prerequisite.

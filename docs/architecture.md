@@ -49,6 +49,12 @@ Use `overlay-bind ARCHIVE WAL` before standalone save commands when creating a g
 
 Existing WALs exposing group/world permissions are rejected instead of silently changing access settings. Plaintext Upper remains distinct from source encryption. After an I/O failure a poisoned Store refuses reads as well as writes until reopened for recovery.
 
-## Library resource-isolation limitation
+## Library resource contract
 
-`Archive::open` checks the packed next-header size before parsing, but the upstream metadata parser can expand encrypted metadata or perform key derivation before payload limits are available. The CLI establishes Linux address-space and CPU limits first. Direct library callers must supply equivalent process isolation for untrusted archives; the library API does not itself guarantee metadata/KDF resource bounds. This remains an explicit unresolved prototype limitation.
+`Archive::open` checks Linux kernel hard limits before path I/O, password construction or metadata parsing: `RLIMIT_AS` must be finite and at most 512 MiB, and `RLIMIT_CPU` finite and at most 120 seconds. Unlimited, oversized, failed-query and non-Linux hosts fail closed. Packed-header, payload and cache policies still apply afterward. The decoder dependency itself has not acquired a bounded metadata allocator.
+
+Dedicated archive hosts can explicitly call `isolation::install_process_limits()` before loading untrusted input. The CLI does so. The helper preserves stricter existing soft/hard limits, verifies the resulting limits, and may partially lower limits before returning an error. Never call it implicitly inside an embedding GUI/server. Limit changes affect every thread and normally cannot be reversed. `Archive::open` only checks limits and never installs them.
+
+This closes the unrestricted public-library parsing path, but is **resource containment, not a supervised worker or general sandbox**. Allocation exhaustion can abort the host; CPU exhaustion can kill it. CPU accounting covers the entire process lifetime, not one request, and lowering address-space limits does not remove mappings already allocated. Privileged actors deliberately changing limits are outside this contract. Long-lived embedders needing availability must provide a separate supervised process, bounded IPC and a wall timeout; this prototype does not provide that broker. See the [Linux resource-limit semantics](https://man7.org/linux/man-pages/man2/getrlimit.2.html).
+
+Tests keep limit changes in fresh exec children with a parent wall deadline. Production-library tests cover unbounded and soft-only hosts, each oversized hard limit, exact ceilings, stricter-limit preservation, unchanged limits after checking, rejection before I/O, and successful encrypted-header parsing/read under the policy. Controlled parser unit fixtures use a private test-only entry point so the parallel test harness is never globally constrained; that entry point does not exist in application builds.
