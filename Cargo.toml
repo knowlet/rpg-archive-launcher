@@ -1,0 +1,15 @@
+[package]
+name = "rpg-archive-launcher"
+version = "0.1.0"
+edition = "2024"
+description = "Experimental memory-only 7z resource reader and durable save overlay for RPG Maker games"
+license = "Apache-2.0"
+
+[dependencies]
+sevenz-rust2 = { version = "=0.24.0", default-features = false, features = ["aes256", "compress"] }
+fs2 = "0.4"
+libc = "0.2"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
