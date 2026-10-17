@@ -2,15 +2,15 @@ use rpg_archive_launcher::vfs::Overlay;
 use rpg_archive_launcher::{
     archive::{Archive, Limits},
     runtime,
-    save::{Entry, Store},
+    save::Store,
 };
 use std::{
     env,
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::Path,
 };
 
-const HELP: &str = "RPG Archive Launcher 0.1 (experimental core, no mount backend yet)\n\nCommands:\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, NAS sync, mount or game execution.\n";
+const HELP: &str = "RPG Archive Launcher 0.1 (experimental core, no mount backend yet)\n\nCommands:\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-bind ARCHIVE WAL [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, NAS sync, mount or game execution.\n";
 fn fail(s: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(s.into()).into()
 }
@@ -65,7 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let expected = match args[0].as_str() {
         "inspect" => 2,
-        "read" | "save-get" | "save-delete" => 3,
+        "read" | "overlay-bind" | "save-get" | "save-delete" => 3,
         "overlay-read" | "overlay-unlink" | "save-put" | "save-rename" => 4,
         "overlay-truncate" | "overlay-rename" => 5,
         "overlay-read-at" | "overlay-write-at" => 6,
@@ -75,12 +75,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(fail("wrong argument count; use --help"));
     }
     match args[0].as_str() {
-        "inspect" | "read" | "overlay-read" | "overlay-read-at" | "overlay-write-at"
-        | "overlay-truncate" | "overlay-unlink" | "overlay-rename" => {
+        "inspect" | "read" | "overlay-bind" | "overlay-read" | "overlay-read-at"
+        | "overlay-write-at" | "overlay-truncate" | "overlay-unlink" | "overlay-rename" => {
             memory_ceiling()?;
             let mut password = String::new();
             if encrypted {
-                io::stdin().take(4097).read_to_string(&mut password)?;
+                let mut line = Vec::new();
+                io::stdin().lock().take(4097).read_until(b'\n', &mut line)?;
+                password = String::from_utf8(line)?;
                 if password.len() > 4096 {
                     return Err(fail("password input exceeds 4096 bytes"));
                 }
@@ -104,13 +106,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         c.engine, c.root, c.native_modules
                     );
                 }
+                println!("runtime report limits: 512 candidates, 64 native modules per candidate");
                 println!(
                     "mount: not implemented; playability: not tested; Linux CLI address-space ceiling: 512 MiB"
                 );
-            } else if args[0].starts_with("overlay-") && args[0] != "overlay-read" {
+            } else if args[0].starts_with("overlay-") {
                 let store = Store::open(&args[2])?;
-                let mut overlay = Overlay::new(archive, store);
+                let mut overlay = Overlay::new(archive, store).map_err(fail)?;
                 match args[0].as_str() {
+                    "overlay-bind" => eprintln!("Upper identity verified and bound locally"),
+                    "overlay-read" => {
+                        io::stdout()
+                            .lock()
+                            .write_all(&overlay.read_file(&args[3]).map_err(fail)?)?;
+                    }
                     "overlay-read-at" => {
                         let bytes = overlay
                             .read_at(&args[3], args[4].parse()?, args[5].parse()?)
@@ -136,16 +145,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ => unreachable!(),
                 }
             } else {
-                let data = if args[0] == "overlay-read" {
-                    let store = Store::open(&args[2])?;
-                    match store.lookup(&args[3])? {
-                        Some(Entry::Data(data)) => data,
-                        Some(Entry::Deleted) => return Err(fail("entry deleted in Upper")),
-                        None => archive.read(&args[3]).map_err(fail)?,
-                    }
-                } else {
-                    archive.read(&args[2]).map_err(fail)?
-                };
+                let data = archive.read(&args[2]).map_err(fail)?;
                 io::stdout().lock().write_all(&data)?;
             }
         }

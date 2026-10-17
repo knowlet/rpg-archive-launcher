@@ -11,11 +11,11 @@
 //! Accounted live state and each record are limited to 16 MiB. Transient
 //! serialization/recovery buffers can consume additional bounded memory. Deleted-key markers
 //! count against that limit. A failed write poisons this handle: reopen to recover.
-//! Unix creation syncs the parent directory. On other platforms this implementation
+//! Every Unix open syncs the parent directory. On other platforms this implementation
 //! fails closed rather than claiming equivalent symlink/directory durability.
 
 use fs2::FileExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -32,11 +32,22 @@ pub enum Entry {
     Deleted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Binding {
+    game_id: [u8; 16],
+    archive_sha256: [u8; 32],
+}
+
+type Changes = Vec<(String, Entry)>;
+
 pub struct Store {
     file: File,
     entries: BTreeMap<String, Entry>,
     live_bytes: usize,
+    live_keys: BTreeSet<String>,
     poisoned: bool,
+    binding: Option<Binding>,
+    has_records: bool,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -79,7 +90,7 @@ pub fn validate_key(key: &str) -> io::Result<()> {
 
 fn cost(key: &str, value: &Entry) -> usize {
     // Conservative per-entry allowance bounds tiny-key map/allocator overhead.
-    key.len()
+    key.len() * 2
         + 256
         + match value {
             Entry::Data(bytes) => bytes.len(),
@@ -107,11 +118,11 @@ impl Store {
                 .write(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            let (mut file, created) = match options.create_new(true).open(path) {
-                Ok(file) => (file, true),
+            let mut file = match options.create_new(true).open(path) {
+                Ok(file) => file,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     options.create_new(false);
-                    (options.open(path)?, false)
+                    options.open(path)?
                 }
                 Err(e) => return Err(e),
             };
@@ -119,21 +130,36 @@ impl Store {
             if !meta.is_file() || meta.nlink() != 1 {
                 return Err(invalid("save store must be a regular file with one link"));
             }
+            if meta.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "save store must not grant group or other permissions",
+                ));
+            }
             FileExt::try_lock_exclusive(&file)?;
             if file.metadata()?.len() > MAX_WAL_BYTES {
                 return Err(invalid("save WAL exceeds 256 MiB limit"));
             }
-            if meta.len() == 0 {
+            // A creator may have crashed after any prefix of the initial magic.
+            // Inspect under the lock, because another opener may have initialized it.
+            let length = file.metadata()?.len();
+            if length < MAGIC.len() as u64 {
+                let mut prefix = vec![0; length as usize];
+                file.read_exact(&mut prefix)?;
+                if prefix != MAGIC[..prefix.len()] {
+                    return Err(invalid("unrecognized partial save store format"));
+                }
+                file.seek(SeekFrom::Start(0))?;
                 file.write_all(MAGIC)?;
                 file.sync_all()?;
             }
-            if created {
-                let parent = path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-                File::open(parent)?.sync_all()?;
-            }
+            // Also cover files created by an opener that crashed before syncing
+            // its directory entry, even when the full magic was already written.
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)?.sync_all()?;
             file.seek(SeekFrom::Start(0))?;
             let mut magic = [0; 8];
             file.read_exact(&mut magic)?;
@@ -144,20 +170,85 @@ impl Store {
                 file,
                 entries: BTreeMap::new(),
                 live_bytes: 0,
+                live_keys: BTreeSet::new(),
                 poisoned: false,
+                binding: None,
+                has_records: false,
             };
             store.recover()?;
             Ok(store)
         }
     }
 
-    pub fn live_names(&self) -> impl Iterator<Item = &str> {
-        self.entries
-            .iter()
-            .filter_map(|(name, entry)| matches!(entry, Entry::Data(_)).then_some(name.as_str()))
+    /// Bind an empty WAL to exactly one archive. Legacy, unbound WALs with
+    /// records are never attached implicitly to an archive.
+    pub fn bind_archive(&mut self, archive_sha256: [u8; 32]) -> io::Result<[u8; 16]> {
+        self.ensure_healthy()?;
+        if let Some(binding) = self.binding {
+            if binding.archive_sha256 != archive_sha256 {
+                return Err(invalid("save store belongs to a different archive"));
+            }
+            return Ok(binding.game_id);
+        }
+        if self.has_records {
+            return Err(invalid(
+                "legacy nonempty save store cannot be bound automatically",
+            ));
+        }
+        let mut game_id = [0; 16];
+        getrandom::fill(&mut game_id)
+            .map_err(|e| io::Error::other(format!("cannot generate game identity: {e}")))?;
+        let mut payload = vec![5];
+        payload.extend_from_slice(&game_id);
+        payload.extend_from_slice(&archive_sha256);
+        self.commit(payload)?;
+        Ok(game_id)
+    }
+
+    fn decode_frame(&self, payload: &[u8]) -> io::Result<(Changes, Option<Binding>)> {
+        if payload.first() == Some(&5) {
+            if payload.len() != 49 || self.has_records || self.binding.is_some() {
+                return Err(invalid("invalid, duplicate, or misplaced archive binding"));
+            }
+            return Ok((
+                Vec::new(),
+                Some(Binding {
+                    game_id: payload[1..17].try_into().unwrap(),
+                    archive_sha256: payload[17..49].try_into().unwrap(),
+                }),
+            ));
+        }
+        Ok((decode(payload, &self.entries)?, None))
+    }
+
+    fn ensure_healthy(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "save handle needs reopening after failed write",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn live_names(&self) -> io::Result<impl Iterator<Item = &str>> {
+        self.ensure_healthy()?;
+        Ok(self.live_keys.iter().map(String::as_str))
+    }
+
+    /// Check for a live file below this logical directory in logarithmic time.
+    pub fn has_live_descendant(&self, path: &str) -> io::Result<bool> {
+        self.ensure_healthy()?;
+        validate_key(path)?;
+        let prefix = format!("{path}/");
+        Ok(self
+            .live_keys
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|name| name.starts_with(&prefix)))
     }
 
     pub fn lookup(&self, key: &str) -> io::Result<Option<Entry>> {
+        self.ensure_healthy()?;
         validate_key(key)?;
         Ok(self.entries.get(key).cloned())
     }
@@ -190,6 +281,7 @@ impl Store {
     /// Replace `to` with `from` and tombstone `from`, atomically. Source must be
     /// present in this Upper layer; archive-backed sources must first be copied up.
     pub fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
+        self.ensure_healthy()?;
         validate_key(from)?;
         validate_key(to)?;
         if !matches!(self.entries.get(from), Some(Entry::Data(_))) {
@@ -210,6 +302,7 @@ impl Store {
     /// Persist a lower-layer rename in one transaction: target bytes and source
     /// tombstone are acknowledged together. Caller resolves the source contents.
     pub fn move_data(&mut self, from: &str, to: &str, bytes: &[u8]) -> io::Result<()> {
+        self.ensure_healthy()?;
         validate_key(from)?;
         validate_key(to)?;
         if from == to {
@@ -232,11 +325,7 @@ impl Store {
     }
 
     fn commit(&mut self, payload: Vec<u8>) -> io::Result<()> {
-        if self.poisoned {
-            return Err(io::Error::other(
-                "save handle needs reopening after failed write",
-            ));
-        }
+        self.ensure_healthy()?;
         if payload.len() > MAX_BYTES {
             return Err(invalid("save record exceeds 16 MiB limit"));
         }
@@ -244,8 +333,9 @@ impl Store {
         {
             return Err(invalid("save WAL is full (256 MiB limit)"));
         }
-        let changes = decode(&payload, &self.entries)?;
+        let (changes, binding) = self.decode_frame(&payload)?;
         let size = self.check_size(&changes)?;
+        self.check_namespace(&changes)?;
         self.poisoned = true;
         self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
         self.file
@@ -253,11 +343,57 @@ impl Store {
         self.file.write_all(&checksum(&payload).to_le_bytes())?;
         self.file.write_all(&payload)?;
         self.file.sync_all()?;
-        for (key, value) in changes {
-            self.entries.insert(key, value);
-        }
+        self.apply_changes(changes);
+        self.binding = binding.or(self.binding);
+        self.has_records = true;
         self.live_bytes = size;
         self.poisoned = false;
+        Ok(())
+    }
+
+    fn apply_changes(&mut self, changes: Vec<(String, Entry)>) {
+        for (key, value) in changes {
+            if matches!(value, Entry::Data(_)) {
+                self.live_keys.insert(key.clone());
+            } else {
+                self.live_keys.remove(&key);
+            }
+            self.entries.insert(key, value);
+        }
+    }
+
+    /// Validate the prospective transaction, including removals, without cloning
+    /// the map or scanning tombstones. Each transaction changes at most two keys.
+    fn check_namespace(&self, changes: &[(String, Entry)]) -> io::Result<()> {
+        let is_live = |key: &str| match changes.iter().find(|(name, _)| name == key) {
+            Some((_, entry)) => matches!(entry, Entry::Data(_)),
+            None => self.live_keys.contains(key),
+        };
+        for (key, entry) in changes {
+            if !matches!(entry, Entry::Data(_)) {
+                continue;
+            }
+            for (index, _) in key.match_indices('/') {
+                if is_live(&key[..index]) {
+                    return Err(invalid("save file conflicts with an ancestor file"));
+                }
+            }
+            let prefix = format!("{key}/");
+            for existing in self.live_keys.range(prefix.clone()..) {
+                if !existing.starts_with(&prefix) {
+                    break;
+                }
+                if is_live(existing) {
+                    return Err(invalid("save file conflicts with a descendant file"));
+                }
+            }
+            if changes
+                .iter()
+                .any(|(name, value)| matches!(value, Entry::Data(_)) && name.starts_with(&prefix))
+            {
+                return Err(invalid("save files conflict within transaction"));
+            }
+        }
         Ok(())
     }
 
@@ -303,11 +439,12 @@ impl Store {
             if checksum(&payload) != crc {
                 return Err(invalid("save frame checksum mismatch"));
             }
-            let changes = decode(&payload, &self.entries)?;
+            let (changes, binding) = self.decode_frame(&payload)?;
             self.live_bytes = self.check_size(&changes)?;
-            for (key, value) in changes {
-                self.entries.insert(key, value);
-            }
+            self.check_namespace(&changes)?;
+            self.apply_changes(changes);
+            self.binding = binding.or(self.binding);
+            self.has_records = true;
             offset += FRAME_HEADER as u64 + size as u64;
         }
         self.file.seek(SeekFrom::End(0))?;
@@ -415,6 +552,17 @@ mod tests {
         }
     }
 
+    fn write_private(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
     #[test]
     fn durable_operations_and_tombstones() {
         let temp = Temp::new();
@@ -490,10 +638,11 @@ mod tests {
         let temp = Temp::new();
         let s = Store::open(temp.path()).unwrap();
         assert!(Store::open(temp.path()).is_err());
+        drop(s);
         let alias = temp.0.join("alias");
         symlink(temp.path(), &alias).unwrap();
         assert!(Store::open(&alias).is_err());
-        drop(s);
+        assert!(Store::open(temp.path()).is_ok());
         let hard = temp.0.join("hard");
         fs::hard_link(temp.path(), &hard).unwrap();
         assert!(Store::open(&hard).is_err());
@@ -571,7 +720,7 @@ mod tests {
         drop(store);
         for length in baseline.len()..=complete.len() {
             let candidate = temp.path().join(format!("cut-{length}.wal"));
-            std::fs::write(&candidate, &complete[..length]).unwrap();
+            write_private(&candidate, &complete[..length]);
             let store = Store::open(candidate).unwrap();
             if length == complete.len() {
                 assert_eq!(store.lookup("lower-source").unwrap(), Some(Entry::Deleted));
@@ -581,5 +730,216 @@ mod tests {
                 assert_eq!(store.get("target").unwrap().unwrap(), b"previous target");
             }
         }
+    }
+    #[test]
+    fn partial_magic_initialization_repairs_only_valid_prefixes() {
+        let temp = Temp::new();
+        for length in 0..MAGIC.len() {
+            let path = temp.0.join(format!("prefix-{length}"));
+            write_private(&path, &MAGIC[..length]);
+            let mut store = Store::open(&path).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), MAGIC);
+            store.put("save", b"ok").unwrap();
+            drop(store);
+            assert_eq!(
+                Store::open(&path).unwrap().get("save").unwrap().unwrap(),
+                b"ok"
+            );
+        }
+        for length in 1..MAGIC.len() {
+            let path = temp.0.join(format!("bad-{length}"));
+            let mut bytes = MAGIC[..length].to_vec();
+            bytes[length - 1] ^= 1;
+            write_private(&path, &bytes);
+            assert!(Store::open(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn group_or_world_permissions_rejected_without_changing_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = Temp::new();
+        for mode in [0o640, 0o604, 0o620, 0o602, 0o610, 0o601, 0o666] {
+            let path = temp.0.join(format!("mode-{mode}"));
+            write_private(&path, MAGIC);
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                Store::open(&path).err().unwrap().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn failed_write_poison_blocks_every_read_and_noop_mutation() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.put("save", b"old").unwrap();
+        // A read-only descriptor deterministically injects an append failure.
+        store.file = File::open(temp.path()).unwrap();
+        assert!(store.put("save", b"new").is_err());
+        assert!(store.poisoned);
+        assert!(store.lookup("save").is_err());
+        assert!(store.get("save").is_err());
+        assert!(store.live_names().is_err());
+        assert!(store.has_live_descendant("save").is_err());
+        assert!(store.rename("save", "save").is_err());
+        assert!(store.move_data("save", "save", b"new").is_err());
+        assert!(store.bind_archive([1; 32]).is_err());
+    }
+
+    #[test]
+    fn prospective_namespace_rejects_conflicts_and_allows_removed_source() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.put("a/b", b"b").unwrap();
+        store.put("a-", b"neighbor").unwrap();
+        assert!(store.put("a", b"bad").is_err());
+        assert!(store.put("a/b/c", b"bad").is_err());
+        store.put("other", b"other").unwrap();
+        assert!(store.rename("other", "a").is_err());
+        assert!(store.move_data("lower", "a", b"bad").is_err());
+        assert!(store.move_data("lower", "a/b/c", b"bad").is_err());
+        store.rename("a/b", "a").unwrap();
+        store.rename("a", "a/c").unwrap();
+        store.move_data("a/c", "a", b"replacement").unwrap();
+        drop(store);
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(store.get("a").unwrap().unwrap(), b"replacement");
+        assert_eq!(
+            store.live_names().unwrap().collect::<Vec<_>>(),
+            vec!["a", "a-", "other"]
+        );
+    }
+
+    fn append_frame(path: &Path, payload: &[u8]) {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(&(payload.len() as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&(!(payload.len() as u32)).to_le_bytes())
+            .unwrap();
+        file.write_all(&checksum(payload).to_le_bytes()).unwrap();
+        file.write_all(payload).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_checksummed_namespace_conflict() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.put("a/b", b"first").unwrap();
+        drop(store);
+        let mut payload = vec![1];
+        encode_key(&mut payload, "a");
+        payload.extend_from_slice(b"conflict");
+        append_frame(&temp.path(), &payload);
+        let before = fs::read(temp.path()).unwrap();
+        assert!(Store::open(temp.path()).is_err());
+        assert_eq!(fs::read(temp.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn archive_binding_is_durable_and_rejects_mismatch_and_legacy_records() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        let id = store.bind_archive([7; 32]).unwrap();
+        assert_eq!(store.bind_archive([7; 32]).unwrap(), id);
+        assert!(store.bind_archive([8; 32]).is_err());
+        store.put("save", b"content").unwrap();
+        drop(store);
+        let mut store = Store::open(temp.path()).unwrap();
+        assert_eq!(store.bind_archive([7; 32]).unwrap(), id);
+        assert!(store.bind_archive([8; 32]).is_err());
+        assert_eq!(store.get("save").unwrap().unwrap(), b"content");
+        let mut legacy = Store::open(temp.0.join("legacy")).unwrap();
+        legacy.delete("unused").unwrap();
+        assert!(legacy.bind_archive([7; 32]).is_err());
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_malformed_and_misplaced_bindings() {
+        let temp = Temp::new();
+        for kind in ["duplicate", "malformed", "misplaced"] {
+            let path = temp.0.join(kind);
+            let mut store = Store::open(&path).unwrap();
+            if kind == "duplicate" {
+                store.bind_archive([1; 32]).unwrap();
+            } else if kind == "misplaced" {
+                store.delete("gone").unwrap();
+            }
+            drop(store);
+            let payload = if kind == "malformed" {
+                vec![5; 48]
+            } else {
+                vec![5; 49]
+            };
+            append_frame(&path, &payload);
+            assert!(Store::open(&path).is_err());
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_sync_poison_blocks_stale_reads() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.put("save", b"old").unwrap();
+        // /dev/null accepts every write but rejects fsync on Linux. This drives
+        // the precise post-write/pre-publication failure path without unsafe fd use.
+        store.file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        assert!(store.put("save", b"new").is_err());
+        assert!(store.poisoned);
+        assert!(store.lookup("save").is_err());
+        assert!(store.get("save").is_err());
+        assert!(store.live_names().is_err());
+        assert!(store.has_live_descendant("save").is_err());
+        drop(store);
+        assert_eq!(
+            Store::open(temp.path())
+                .unwrap()
+                .get("save")
+                .unwrap()
+                .unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn binding_recovers_atomically_at_every_frame_prefix() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        let id = store.bind_archive([7; 32]).unwrap();
+        drop(store);
+        let complete = fs::read(temp.path()).unwrap();
+        for length in MAGIC.len()..=complete.len() {
+            let path = temp.0.join(format!("binding-cut-{length}"));
+            write_private(&path, &complete[..length]);
+            let mut recovered = Store::open(&path).unwrap();
+            if length == complete.len() {
+                assert_eq!(recovered.bind_archive([7; 32]).unwrap(), id);
+                assert!(recovered.bind_archive([8; 32]).is_err());
+            } else {
+                assert_eq!(fs::metadata(&path).unwrap().len(), MAGIC.len() as u64);
+                recovered.bind_archive([8; 32]).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn live_descendant_checks_component_boundaries_and_tombstones() {
+        let temp = Temp::new();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.put("a-/b", b"neighbor").unwrap();
+        store.put("aa/b", b"neighbor").unwrap();
+        assert!(!store.has_live_descendant("a").unwrap());
+        store.put("a/b/c", b"nested").unwrap();
+        assert!(store.has_live_descendant("a").unwrap());
+        assert!(store.has_live_descendant("a/b").unwrap());
+        assert!(!store.has_live_descendant("a/b/c").unwrap());
+        store.delete("a/b/c").unwrap();
+        assert!(!store.has_live_descendant("a").unwrap());
+        assert!(store.has_live_descendant("../a").is_err());
     }
 }

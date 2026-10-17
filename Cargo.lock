@@ -268,8 +268,10 @@ name = "rpg-archive-launcher"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "getrandom",
  "libc",
  "sevenz-rust2",
+ "sha2",
  "tempfile",
  "unicode-normalization",
 ]

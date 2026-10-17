@@ -37,6 +37,7 @@ pub struct Archive {
     password: Password,
     limits: Limits,
     index: BTreeMap<String, usize>,
+    explicit_directories: HashSet<String>,
     cache: Option<(String, Vec<u8>)>,
 }
 
@@ -154,6 +155,8 @@ fn validate_stream_layout(metadata: &Metadata) -> Result<()> {
             *total = total.checked_add(entry.size).ok_or("block size overflow")?;
         } else if entry.has_stream {
             return Err("streamed entry has no block".into());
+        } else if entry.size != 0 {
+            return Err("streamless entry has nonzero size".into());
         }
     }
     for (block, total) in metadata.blocks.iter().zip(totals) {
@@ -169,7 +172,19 @@ impl Archive {
         if limits.max_file_bytes > usize::MAX as u64 || limits.max_cache_bytes > usize::MAX as u64 {
             return Err("memory limits exceed platform address size".into());
         }
-        let mut source = File::open(path).map_err(|e| e.to_string())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        // Open first, then inspect the same descriptor to avoid a path-check race.
+        // NONBLOCK ensures a malicious FIFO cannot hang us before fstat.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let mut source = options.open(path).map_err(|e| e.to_string())?;
+        if !source.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("archive source must be a regular file".into());
+        }
         header_preflight(&mut source)?;
         let password = Password::new(password);
         // Metadata::read uses one decoding thread, including encrypted headers.
@@ -182,6 +197,7 @@ impl Archive {
         let mut index = BTreeMap::new();
         let mut seen = HashSet::new();
         let mut file_keys = HashSet::new();
+        let mut explicit_directories = HashSet::new();
         for (i, entry) in metadata.files.iter().enumerate() {
             let name = if entry.is_directory {
                 entry.name.strip_suffix('/').unwrap_or(&entry.name)
@@ -214,6 +230,11 @@ impl Archive {
             if !entry.is_directory {
                 file_keys.insert(key);
                 index.insert(name.to_owned(), i);
+            } else {
+                explicit_directories.insert(name.to_owned());
+                for (pos, _) in name.match_indices('/') {
+                    explicit_directories.insert(name[..pos].to_owned());
+                }
             }
         }
         for name in &seen {
@@ -249,12 +270,61 @@ impl Archive {
             password,
             limits,
             index,
+            explicit_directories,
             cache: None,
         })
     }
 
+    /// Hash the full opened archive, including its compressed payload and header.
+    /// Uses a fixed-size buffer and preserves the descriptor's current position.
+    /// Concurrent archive mutation is unsupported. Length/mtime checks catch
+    /// common changes during hashing, but do not make it an immutable snapshot.
+    pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let before = self.source.metadata().map_err(|e| e.to_string())?;
+        let position = self.source.stream_position().map_err(|e| e.to_string())?;
+        self.source
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = self.source.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            let after = self.source.metadata().map_err(|e| e.to_string())?;
+            if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+                return Err("archive changed while computing its revision".into());
+            }
+            Ok(hash.finalize().into())
+        })();
+        self.source
+            .seek(SeekFrom::Start(position))
+            .map_err(|e| e.to_string())?;
+        result
+    }
+
+    /// Explicit directory records and their ancestors remain directories even
+    /// when every lower file below them is hidden by an Upper tombstone.
+    pub fn is_explicit_directory(&self, name: &str) -> bool {
+        self.explicit_directories.contains(name)
+    }
+
     pub fn file_size(&self, name: &str) -> Option<u64> {
         self.index.get(name).map(|&i| self.metadata.files[i].size)
+    }
+
+    /// Visit only indexed file descendants, without cloning the entire index.
+    pub fn descendant_names(&self, path: &str) -> impl Iterator<Item = &str> {
+        let prefix = format!("{path}/");
+        self.index
+            .range(prefix.clone()..)
+            .take_while(move |(name, _)| name.starts_with(&prefix))
+            .map(|(name, _)| name.as_str())
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -559,6 +629,101 @@ mod tests {
         bytes[..6].copy_from_slice(b"7z\xbc\xaf\x27\x1c");
         bytes[20..28].copy_from_slice(&(9u64 << 20).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
-        assert!(Archive::open(path, "", Limits::default()).is_err());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(32 + (9 << 20)).unwrap();
+        assert!(
+            header_preflight(&mut file)
+                .unwrap_err()
+                .contains("between 1 byte and 8 MiB")
+        );
+    }
+
+    #[test]
+    fn descendants_range_is_exact_and_excludes_neighboring_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("range.7z");
+        fixture(
+            &path,
+            &["a/file", "a/nested/file", "a-other", "aa/file", "b/file"],
+            false,
+        );
+        let archive = Archive::open(&path, "", Limits::default()).unwrap();
+        assert_eq!(
+            archive.descendant_names("a").collect::<Vec<_>>(),
+            ["a/file", "a/nested/file"]
+        );
+        assert_eq!(
+            archive.descendant_names("a/nested").collect::<Vec<_>>(),
+            ["a/nested/file"]
+        );
+        assert_eq!(archive.descendant_names("a/file").count(), 0);
+        assert_eq!(archive.descendant_names("missing").count(), 0);
+    }
+
+    #[test]
+    fn revision_hashes_payload_and_preserves_position() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("revision.7z");
+        fixture(&path, &["data.json"], false);
+        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        archive.source.seek(SeekFrom::Start(7)).unwrap();
+        let revision = archive.revision_sha256().unwrap();
+        let expected: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
+        assert_eq!(revision, expected);
+        assert_eq!(archive.source.stream_position().unwrap(), 7);
+        assert_eq!(archive.read("data.json").unwrap(), b"hello archive");
+    }
+
+    #[test]
+    fn rejects_streamless_nonzero_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("empty.7z");
+        let mut writer = ArchiveWriter::create(&path).unwrap();
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("empty"), None::<&[u8]>)
+            .unwrap();
+        writer.finish().unwrap();
+        let mut archive = Archive::open(&path, "", Limits::default()).unwrap();
+        assert!(!archive.metadata.files[0].has_stream);
+        archive.metadata.files[0].size = 1;
+        assert!(
+            validate_stream_layout(&archive.metadata)
+                .unwrap_err()
+                .contains("nonzero size")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nonregular_sources_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fifo.7z");
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        // No writer opens the FIFO. A blocking File::open would hang this test.
+        assert!(
+            Archive::open(&path, "", Limits::default())
+                .err()
+                .unwrap()
+                .contains("regular file")
+        );
+        assert!(
+            Archive::open(temp.path(), "", Limits::default())
+                .err()
+                .unwrap()
+                .contains("regular file")
+        );
+        assert!(
+            Archive::open("/dev/null", "", Limits::default())
+                .err()
+                .unwrap()
+                .contains("regular file")
+        );
     }
 }

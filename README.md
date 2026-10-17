@@ -26,6 +26,7 @@ cargo build --release --locked
 cargo run --example make_demo -- demo.7z
 cargo run -- inspect demo.7z
 cargo run -- read demo.7z data/System.json
+cargo run -- overlay-bind demo.7z /private/local/path/game.wal
 cargo run -- save-put /private/local/path/game.wal save/file1.rpgsave ./new-save
 cargo run -- overlay-read demo.7z /private/local/path/game.wal save/file1.rpgsave
 cargo run -- save-rename /private/local/path/game.wal save/file1.rpgsave save/file2.rpgsave
@@ -45,11 +46,12 @@ Encrypted archives accept a single UTF-8 password line via stdin with `--passwor
 - Archive CLI is currently Linux-only: a 512 MiB process virtual-address-space ceiling is applied before parsing untrusted headers. This is not an RSS guarantee or sandbox. Allocation exhaustion can terminate the process. A 120-second CPU-time ceiling also applies to each archive CLI invocation, including malicious header key derivation; large solid reads may hit it.
 - Entry, dictionary and cache limits are reported by `inspect`; unsupported layouts/codecs are rejected, not silently extracted.
 - Large solid blocks can require decoding preceding files repeatedly. This prototype is not the final block-coalescing scheduler and does not claim acceptable game latency.
+- Each Overlay WAL binds a random stable game ID to the SHA-256 of its accepted immutable archive revision. Different archives/revisions fail closed; binding requires a new empty WAL. Existing populated legacy WALs are not automatically migrated. Opening an Overlay reads the entire source archive to verify its digest, including across NAS; see the [binding policy](docs/architecture.md#archive-binding-policy).
 - Upper is **plaintext**. Keep its log in a private, trusted directory on a local filesystem. Source archive encryption does not encrypt saves.
 - Save persistence is separate from “synced to NAS” and “merged into archive.” Neither latter operation exists yet.
 - Upper currently requires Unix filesystem semantics and fails closed on other systems. Upper WAL must not be shared over SMB/NAS between active devices. One writer is enforced locally; cross-device coordination is not implemented.
 - COW is not a sandbox. Future NW.js games can execute code with user privileges.
-- The runtime detector is a heuristic only. Native `.node`/DLL dependencies are reported and not repaired.
+- The runtime detector is a heuristic only, with reports capped at 512 candidates and 64 native modules per candidate. Native `.node`/DLL dependencies are reported and not repaired.
 - Only file-level Upper operations are implemented. General POSIX directory/rename semantics and open-handle behavior remain future VFS work. Byte operations commit a bounded full-file replacement per mutation, rather than journaling individual ranges. `read_at` also buffers the whole file and currently rejects files around 16 MiB even for a small slice; it is a correctness prototype, not the final streaming data path.
 
 ## Planned acceptance gates

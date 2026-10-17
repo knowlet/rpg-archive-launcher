@@ -24,8 +24,20 @@ fn file_limit(path: &str, other: Option<&str>) -> usize {
 }
 
 impl Overlay {
-    pub fn new(archive: Archive, upper: Store) -> Self {
-        Self { archive, upper }
+    pub fn new(archive: Archive, upper: Store) -> Result<Self> {
+        let mut overlay = Self { archive, upper };
+        // Raw save commands and externally supplied WALs may contain keys that
+        // are valid individually but inconsistent with this lower namespace.
+        for name in overlay.upper.live_names().map_err(|e| e.to_string())? {
+            Self::validate(name)?;
+            overlay.validate_destination(name)?;
+        }
+        let revision = overlay.archive.revision_sha256()?;
+        overlay
+            .upper
+            .bind_archive(revision)
+            .map_err(|e| e.to_string())?;
+        Ok(overlay)
     }
 
     fn validate(path: &str) -> Result<()> {
@@ -42,21 +54,23 @@ impl Overlay {
     }
 
     fn validate_destination(&self, path: &str) -> Result<()> {
+        if self.archive.is_explicit_directory(path) {
+            return Err("destination is an explicit archive directory".into());
+        }
         for (index, _) in path.match_indices('/') {
             if self.exists(&path[..index])? {
                 return Err("destination ancestor is a file".into());
             }
         }
-        let prefix = format!("{path}/");
         if self
             .upper
-            .live_names()
-            .any(|name| name.starts_with(&prefix))
+            .has_live_descendant(path)
+            .map_err(|e| e.to_string())?
         {
             return Err("destination is an implicit directory".into());
         }
-        for name in self.archive.names() {
-            if name.starts_with(&prefix) && self.exists(&name)? {
+        for name in self.archive.descendant_names(path) {
+            if self.exists(name)? {
                 return Err("destination is an implicit directory".into());
             }
         }
@@ -82,6 +96,11 @@ impl Overlay {
             return Err("file exceeds bounded Overlay buffer limit".into());
         }
         Ok(data)
+    }
+
+    pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
+        self.contents(path, file_limit(path, None))?
+            .ok_or_else(|| "file not found".into())
     }
 
     pub fn read_at(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
@@ -215,7 +234,148 @@ mod tests {
             Archive::open(dir.join("game.7z"), "", Limits::default()).unwrap(),
             Store::open(dir.join("upper.wal")).unwrap(),
         )
+        .unwrap()
     }
+    #[test]
+    fn explicit_empty_directories_and_ancestors_cannot_be_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("game.7z");
+        let mut writer = ArchiveWriter::create(&path).unwrap();
+        let mut directory = ArchiveEntry::new_file("empty/nested/");
+        directory.is_directory = true;
+        writer.push_archive_entry(directory, None::<&[u8]>).unwrap();
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("source"), Some(b"x".as_slice()))
+            .unwrap();
+        writer.finish().unwrap();
+        let mut overlay = open(temp.path());
+        let before = fs::read(temp.path().join("upper.wal")).unwrap();
+        for destination in ["empty", "empty/nested"] {
+            assert!(overlay.write_at(destination, 0, b"x").is_err());
+            assert!(overlay.rename("source", destination).is_err());
+        }
+        assert_eq!(fs::read(temp.path().join("upper.wal")).unwrap(), before);
+        overlay.write_at("empty/nested/new", 0, b"x").unwrap();
+        drop(overlay);
+        let mut overlay = open(temp.path());
+        assert_eq!(overlay.read_at("empty/nested/new", 0, 1).unwrap(), b"x");
+    }
+
+    #[test]
+    fn persisted_upper_conflicting_with_lower_is_rejected_at_open() {
+        for key in ["data", "data/a/child"] {
+            let temp = tempfile::tempdir().unwrap();
+            fixture(temp.path());
+            let wal = temp.path().join("upper.wal");
+            let mut store = Store::open(&wal).unwrap();
+            let revision = Archive::open(temp.path().join("game.7z"), "", Limits::default())
+                .unwrap()
+                .revision_sha256()
+                .unwrap();
+            store.bind_archive(revision).unwrap();
+            store.put(key, b"raw save").unwrap();
+            drop(store);
+            let before = fs::read(&wal).unwrap();
+            assert!(
+                Overlay::new(
+                    Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+                    Store::open(&wal).unwrap(),
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&wal).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn persisted_upper_cannot_replace_explicit_directory_or_ancestor() {
+        for key in ["empty", "empty/nested"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut writer = ArchiveWriter::create(temp.path().join("game.7z")).unwrap();
+            let mut entry = ArchiveEntry::new_file("empty/nested");
+            entry.is_directory = true;
+            writer.push_archive_entry(entry, None::<&[u8]>).unwrap();
+            writer.finish().unwrap();
+            let mut upper = Store::open(temp.path().join("upper.wal")).unwrap();
+            let revision = Archive::open(temp.path().join("game.7z"), "", Limits::default())
+                .unwrap()
+                .revision_sha256()
+                .unwrap();
+            upper.bind_archive(revision).unwrap();
+            upper.put(key, b"raw save").unwrap();
+            assert!(
+                Overlay::new(
+                    Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+                    upper,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn upper_cannot_reopen_against_a_different_archive_revision() {
+        for replacement_name in ["game.7z", "other-game.7z"] {
+            let temp = tempfile::tempdir().unwrap();
+            fixture(temp.path());
+            let mut overlay = open(temp.path());
+            overlay.write_at("save/b", 0, b"progress").unwrap();
+            drop(overlay);
+            let before = fs::read(temp.path().join("upper.wal")).unwrap();
+            let replacement = temp.path().join(replacement_name);
+            let mut writer = ArchiveWriter::create(&replacement).unwrap();
+            // Identical keys and member sizes, but different payload bytes.
+            for (name, bytes) in [
+                ("data/a", b"ABCDEF".as_slice()),
+                ("save/b", b"old".as_slice()),
+            ] {
+                writer
+                    .push_archive_entry(ArchiveEntry::new_file(name), Some(bytes))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            let error = Overlay::new(
+                Archive::open(replacement, "", Limits::default()).unwrap(),
+                Store::open(temp.path().join("upper.wal")).unwrap(),
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains("different archive"));
+            assert_eq!(fs::read(temp.path().join("upper.wal")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn empty_upper_binds_once_and_reopens_without_wal_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture(temp.path());
+        drop(Store::open(temp.path().join("upper.wal")).unwrap());
+        let before = fs::read(temp.path().join("upper.wal")).unwrap();
+        drop(open(temp.path()));
+        let bound = fs::read(temp.path().join("upper.wal")).unwrap();
+        assert!(bound.len() > before.len());
+        let mut overlay = open(temp.path());
+        assert_eq!(overlay.read_file("data/a").unwrap(), b"abcdef");
+        assert_eq!(fs::read(temp.path().join("upper.wal")).unwrap(), bound);
+    }
+
+    #[test]
+    fn legacy_upper_with_nonconflicting_data_cannot_bind_implicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture(temp.path());
+        let mut upper = Store::open(temp.path().join("upper.wal")).unwrap();
+        upper.put("save/b", b"progress").unwrap();
+        let before = fs::read(temp.path().join("upper.wal")).unwrap();
+        let error = Overlay::new(
+            Archive::open(temp.path().join("game.7z"), "", Limits::default()).unwrap(),
+            upper,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("legacy nonempty"));
+        assert_eq!(fs::read(temp.path().join("upper.wal")).unwrap(), before);
+    }
+
     #[test]
     fn readonly_reads_never_copy_up_or_mutate_archive() {
         let temp = tempfile::tempdir().unwrap();
@@ -274,7 +434,8 @@ mod tests {
             )
             .unwrap(),
             Store::open(temp.path().join("upper.wal")).unwrap(),
-        );
+        )
+        .unwrap();
         let wal = temp.path().join("upper.wal");
         let before = fs::read(&wal).unwrap();
         overlay.write_at("data/a", 0, b"").unwrap();

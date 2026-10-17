@@ -74,6 +74,14 @@ fn encrypted_archive_and_upper_survive_separate_processes() {
         .stdout,
         b"old"
     );
+    assert_eq!(
+        cli(
+            &["overlay-read", a, w, "save/file1", "--password-stdin"],
+            Some("秘密🔑\n")
+        )
+        .stdout,
+        b"old"
+    );
     std::fs::write(&input, b"new save").unwrap();
     assert!(
         cli(
@@ -218,4 +226,50 @@ fn overlay_byte_operations_persist_across_commands() {
             .success()
     );
     assert_eq!(std::fs::read(&archive).unwrap(), original);
+}
+
+#[test]
+fn password_line_does_not_wait_for_stdin_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("password.7z");
+    let mut writer = ArchiveWriter::create(&archive).unwrap();
+    writer.set_content_methods(vec![
+        AesEncoderOptions::new(Password::new("test-password")).into(),
+        Lzma2Options::default().into(),
+    ]);
+    writer.set_encrypt_header(true);
+    writer
+        .push_archive_entry(ArchiveEntry::new_file("file"), Some(b"bytes".as_slice()))
+        .unwrap();
+    writer.finish().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rpg-archive-launcher"))
+        .args([
+            "read",
+            archive.to_str().unwrap(),
+            "file",
+            "--password-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut open_stdin = child.stdin.take().unwrap();
+    open_stdin.write_all(b"test-password\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("password reader waited for EOF despite receiving newline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"bytes");
+    drop(open_stdin);
 }
