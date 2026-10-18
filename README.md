@@ -1,5 +1,11 @@
 # rpg-archive-launcher
 
+> This branch adds an experimental supervised decoder, read-only FUSE adapter,
+> independent save-prefix Upper API, and explicit NW.js directory launch.
+> See [macOS probe and acceptance limits](docs/macos-playability.md).
+> Real macOS mounts, NW.js gameplay, and mounted saves are not yet accepted.
+> The core-command description below remains applicable to the original CLI.
+
 An experimental Rust core for reading encrypted 7z RPG Maker resources in memory and keeping user changes in a durable, separate local Upper store.
 
 **Status: first CLI/core prototype, not a playable launcher.** There is no filesystem mount or NW.js execution yet. Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
