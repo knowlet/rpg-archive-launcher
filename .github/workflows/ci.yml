@@ -1,14 +1,39 @@
-name: Rust core
+name: Rust core and playability probe
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
   linux-core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Install user-space FUSE development files and 7-Zip
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev fuse p7zip-full
+      - run: cargo clippy --locked --all-targets --features fuse -- -D warnings
+      - run: cargo test --locked --features fuse
+      - run: cargo build --locked --features fuse
+      - name: Conditional real mount smoke (explicit skip if no device)
+        run: python3 scripts/test_mount_smoke.py
+      - name: 7-Zip interoperability
+        run: python3 scripts/test_7zip_interop.py "$(command -v 7z)" target/debug/rpg-archive-launcher
+  macos-worker:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Acceptance boundary
+        run: echo 'Native decoder and library tests only. macFUSE adapter, extension activation, actual macOS mounts, NW.js GUI and gameplay are NOT verified by this job.'

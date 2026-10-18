@@ -230,6 +230,12 @@ impl Store {
         Ok(())
     }
 
+    /// All logical keys, including tombstones, for namespace policy checks.
+    pub fn names(&self) -> io::Result<impl Iterator<Item = &str>> {
+        self.ensure_healthy()?;
+        Ok(self.entries.keys().map(String::as_str))
+    }
+
     pub fn live_names(&self) -> io::Result<impl Iterator<Item = &str>> {
         self.ensure_healthy()?;
         Ok(self.live_keys.iter().map(String::as_str))

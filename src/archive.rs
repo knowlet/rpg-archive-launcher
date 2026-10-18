@@ -63,9 +63,15 @@ fn source_stamp(source: &File) -> Result<SourceStamp> {
         #[cfg(unix)]
         identity: {
             use std::os::unix::fs::MetadataExt;
-            (metadata.dev(), metadata.ino(), metadata.nlink(),
-             metadata.mtime(), metadata.mtime_nsec(),
-             metadata.ctime(), metadata.ctime_nsec())
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
         },
     })
 }
@@ -335,6 +341,7 @@ impl Archive {
         }
         Ok(Self {
             source,
+            source_stamp,
             metadata,
             password,
             limits,
@@ -342,39 +349,6 @@ impl Archive {
             explicit_directories,
             cache: None,
         })
-    }
-
-    /// Hash the full opened archive, including its compressed payload and header.
-    /// Uses a fixed-size buffer and preserves the descriptor's current position.
-    /// Concurrent archive mutation is unsupported. Length/mtime checks catch
-    /// common changes during hashing, but do not make it an immutable snapshot.
-    pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
-        let before = self.source.metadata().map_err(|e| e.to_string())?;
-        let position = self.source.stream_position().map_err(|e| e.to_string())?;
-        self.source
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| e.to_string())?;
-        let result = (|| {
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let count = self.source.read(&mut buffer).map_err(|e| e.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-            }
-            let after = self.source.metadata().map_err(|e| e.to_string())?;
-            if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
-                return Err("archive changed while computing its revision".into());
-            }
-            Ok(hash.finalize().into())
-        })();
-        self.source
-            .seek(SeekFrom::Start(position))
-            .map_err(|e| e.to_string())?;
-        result
     }
 
     /// Explicit directory records and their ancestors remain directories even
@@ -444,21 +418,36 @@ impl Archive {
 
     pub(crate) fn ensure_source_unchanged(&self) -> Result<()> {
         if source_stamp(&self.source)? != self.source_stamp {
-            return Err("archive source changed after opening; reopen against a new revision".into());
+            return Err(
+                "archive source changed after opening; reopen against a new revision".into(),
+            );
         }
         Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn bounded_entries(&self, maximum: usize, byte_budget: usize) -> Result<Vec<(String, Option<u64>)>> {
-        if self.index.len().saturating_add(self.explicit_directories.len()) > maximum {
+    pub(crate) fn bounded_entries(
+        &self,
+        maximum: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<(String, Option<u64>)>> {
+        if self
+            .index
+            .len()
+            .saturating_add(self.explicit_directories.len())
+            > maximum
+        {
             return Err("worker namespace entry limit exceeded".into());
         }
-        let mut required=36usize;
+        let mut required = 36usize;
         for name in self.index.keys().chain(self.explicit_directories.iter()) {
-            required=required.checked_add(13usize.saturating_add(name.len())).ok_or("metadata overflow")?;
+            required = required
+                .checked_add(13usize.saturating_add(name.len()))
+                .ok_or("metadata overflow")?;
         }
-        if required>byte_budget { return Err("worker metadata byte limit exceeded".into()) }
+        if required > byte_budget {
+            return Err("worker metadata byte limit exceeded".into());
+        }
         Ok(self.entries())
     }
 
@@ -467,27 +456,41 @@ impl Archive {
     pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         self.ensure_source_unchanged()?;
-        let position=self.source.stream_position().map_err(|e| e.to_string())?;
-        self.source.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let result=(|| {
-            let mut hash=Sha256::new();
-            let mut buffer=[0u8;64*1024];
+        let position = self.source.stream_position().map_err(|e| e.to_string())?;
+        self.source
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
             loop {
-                let count=self.source.read(&mut buffer).map_err(|e|e.to_string())?;
-                if count==0 {break}
+                let count = self.source.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
                 hash.update(&buffer[..count]);
             }
             self.ensure_source_unchanged()?;
             Ok(hash.finalize().into())
         })();
-        self.source.seek(SeekFrom::Start(position)).map_err(|e|e.to_string())?;
+        self.source
+            .seek(SeekFrom::Start(position))
+            .map_err(|e| e.to_string())?;
         result
     }
 
     pub fn entries(&self) -> Vec<(String, Option<u64>)> {
-        let mut entries: Vec<_>=self.explicit_directories.iter().map(|name|(name.clone(),None))
-            .chain(self.index.iter().map(|(name,&idx)|(name.clone(),Some(self.metadata.files[idx].size)))).collect();
-        entries.sort_unstable_by(|a,b|a.0.cmp(&b.0));
+        let mut entries: Vec<_> = self
+            .explicit_directories
+            .iter()
+            .map(|name| (name.clone(), None))
+            .chain(
+                self.index
+                    .iter()
+                    .map(|(name, &idx)| (name.clone(), Some(self.metadata.files[idx].size))),
+            )
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         entries
     }
 
@@ -559,6 +562,18 @@ impl Archive {
             self.cache = Some((name.to_owned(), output.clone()));
         }
         Ok(output)
+    }
+}
+
+impl ArchiveSource for Archive {
+    fn entries(&self) -> Vec<(String, Option<u64>)> {
+        Archive::entries(self)
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+        Archive::read(self, path)
+    }
+    fn revision_sha256(&mut self) -> Result<[u8; 32]> {
+        Archive::revision_sha256(self)
     }
 }
 
@@ -853,10 +868,4 @@ mod tests {
                 .contains("regular file")
         );
     }
-}
-
-impl ArchiveSource for Archive {
-    fn entries(&self) -> Vec<(String, Option<u64>)> { Archive::entries(self) }
-    fn read(&mut self, path: &str) -> Result<Vec<u8>> { Archive::read(self,path) }
-    fn revision_sha256(&mut self) -> Result<[u8; 32]> { Archive::revision_sha256(self) }
 }

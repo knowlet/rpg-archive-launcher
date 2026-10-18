@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-const HELP: &str = "RPG Archive Launcher 0.1 (experimental core, no mount backend yet)\n\nCommands:\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-bind ARCHIVE WAL [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, NAS sync, mount or game execution.\n";
+const HELP: &str = "RPG Archive Launcher 0.1 (experimental read-only mount probe)\n\nCommands:\n  probe-read ARCHIVE ENTRY [--password-stdin]\n  mount-ro ARCHIVE MOUNTPOINT BACKEND [--password-stdin] (feature fuse; BACKEND: kernel|fskit)\n  launch-directory MOUNTPOINT GAME_ROOT NWJS_EXECUTABLE PROFILE\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-bind ARCHIVE WAL [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, or NAS sync. Mounted saves are unsupported.\nlaunch-directory executes explicitly trusted game code without a sandbox.\n";
 fn fail(s: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(s.into()).into()
 }
@@ -29,13 +29,92 @@ fn input_file(path: &str) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+fn read_password(encrypted: bool) -> Result<String, Box<dyn std::error::Error>> {
+    if !encrypted {
+        return Ok(String::new());
+    }
+    let mut line = Vec::new();
+    io::stdin().lock().take(4097).read_until(b'\n', &mut line)?;
+    if line.len() > 4096 {
+        return Err(fail("password exceeds 4096 bytes"));
+    }
+    let mut password = String::from_utf8(line)?;
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    Ok(password)
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "__decoder-worker") {
+        return rpg_archive_launcher::worker::serve().map_err(fail);
+    }
     let encrypted = args.iter().any(|s| s == "--password-stdin");
     args.retain(|s| s != "--password-stdin");
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print!("{HELP}");
         return Ok(());
+    }
+    if args[0] == "launch-directory" {
+        if encrypted || args.len() != 5 {
+            return Err(fail(
+                "launch-directory requires MOUNTPOINT GAME_ROOT NWJS_EXECUTABLE PROFILE",
+            ));
+        }
+        let plan = rpg_archive_launcher::launcher::LaunchPlan::new(
+            Path::new(&args[1]),
+            &args[2],
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+        )?;
+        let status = plan.run()?;
+        if !status.success() {
+            return Err(fail(format!("NW.js exited with {status}")));
+        }
+        return Ok(());
+    }
+    if args[0] == "probe-read" || args[0] == "mount-ro" {
+        let expected = if args[0] == "probe-read" { 3 } else { 4 };
+        if args.len() != expected {
+            return Err(fail("wrong argument count; use --help"));
+        }
+        let password = read_password(encrypted)?;
+        let worker = rpg_archive_launcher::worker::DecoderWorker::spawn(
+            &env::current_exe()?,
+            Path::new(&args[1]),
+            &password,
+        )
+        .map_err(fail)?;
+        drop(password);
+        #[cfg(unix)]
+        {
+            let mut fs =
+                rpg_archive_launcher::filesystem::Filesystem::readonly(worker).map_err(fail)?;
+            if args[0] == "probe-read" {
+                io::stdout()
+                    .lock()
+                    .write_all(&fs.read_at(&args[2], 0, 16 * 1024 * 1024).map_err(fail)?)?;
+                return Ok(());
+            }
+            #[cfg(feature = "fuse")]
+            {
+                let fskit = match args[3].as_str() {
+                    "fskit" => true,
+                    "kernel" => false,
+                    _ => return Err(fail("backend must be kernel or fskit")),
+                };
+                return rpg_archive_launcher::mount::readonly(fs, Path::new(&args[2]), fskit)
+                    .map_err(fail);
+            }
+            #[cfg(not(feature = "fuse"))]
+            return Err(fail("mount-ro requires building with --features fuse"));
+        }
+        #[cfg(not(unix))]
+        return Err(fail("probe filesystem is unsupported on this OS"));
     }
     let expected = match args[0].as_str() {
         "inspect" => 2,

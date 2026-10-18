@@ -57,7 +57,9 @@ impl LaunchPlan {
         }
         let game_directory = fs::canonicalize(mountpoint.join(game_root))?;
         if !game_directory.is_dir() || !game_directory.starts_with(&mountpoint) {
-            return Err(invalid("game root must remain inside the mounted directory"));
+            return Err(invalid(
+                "game root must remain inside the mounted directory",
+            ));
         }
         let manifest: serde_json::Value =
             serde_json::from_slice(&regular_read(&game_directory.join("package.json"))?)
@@ -91,20 +93,32 @@ impl LaunchPlan {
         }
         let profile_meta = fs::symlink_metadata(profile)?;
         if !profile_meta.is_dir() || profile_meta.file_type().is_symlink() {
-            return Err(invalid("profile must be an existing non-symlink local directory"));
+            return Err(invalid(
+                "profile must be an existing non-symlink local directory",
+            ));
         }
         let profile_directory = fs::canonicalize(profile)?;
-        if profile_directory.starts_with(&mountpoint) || mountpoint.starts_with(&profile_directory) {
-            return Err(invalid("profile and mounted game directories must not overlap"));
+        if profile_directory.starts_with(&mountpoint) || mountpoint.starts_with(&profile_directory)
+        {
+            return Err(invalid(
+                "profile and mounted game directories must not overlap",
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if profile_meta.uid() != unsafe { libc::geteuid() } || profile_meta.mode() & 0o077 != 0 {
-                return Err(invalid("profile directory must be owned by this user with mode 0700"));
+            if profile_meta.uid() != unsafe { libc::geteuid() } || profile_meta.mode() & 0o077 != 0
+            {
+                return Err(invalid(
+                    "profile directory must be owned by this user with mode 0700",
+                ));
             }
         }
-        Ok(Self { executable, game_directory, profile_directory })
+        Ok(Self {
+            executable,
+            game_directory,
+            profile_directory,
+        })
     }
 
     pub fn command(&self) -> Command {
@@ -138,7 +152,11 @@ mod tests {
         fs::create_dir(&game).unwrap();
         fs::create_dir(&profile).unwrap();
         fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(game.join("package.json"), br#"{"name":"fixture","main":"index.html"}"#).unwrap();
+        fs::write(
+            game.join("package.json"),
+            br#"{"name":"fixture","main":"index.html"}"#,
+        )
+        .unwrap();
         fs::write(game.join("index.html"), "synthetic fixture").unwrap();
         let runtime = temp.path().join("fake nwjs");
         fs::write(&runtime, "#!/bin/sh\nexit 7\n").unwrap();
@@ -154,7 +172,10 @@ mod tests {
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args.len(), 2);
         assert_eq!(args[1], fs::canonicalize(&game).unwrap().as_os_str());
-        assert_eq!(cmd.get_current_dir().unwrap(), fs::canonicalize(&game).unwrap());
+        assert_eq!(
+            cmd.get_current_dir().unwrap(),
+            fs::canonicalize(&game).unwrap()
+        );
         assert_eq!(plan.run().unwrap().code(), Some(7));
     }
 
@@ -162,9 +183,17 @@ mod tests {
     fn rejects_escape_and_profile_inside_mount_before_execution() {
         let (_temp, game, profile, runtime) = setup();
         assert!(LaunchPlan::new(&game, "../profile", &runtime, &profile).is_err());
-        fs::write(game.join("package.json"), br#"{"main":"../profile/out.html"}"#).unwrap();
+        fs::write(
+            game.join("package.json"),
+            br#"{"main":"../profile/out.html"}"#,
+        )
+        .unwrap();
         assert!(LaunchPlan::new(&game, "", &runtime, &profile).is_err());
-        fs::write(game.join("package.json"), br#"{"main":"https://example.com"}"#).unwrap();
+        fs::write(
+            game.join("package.json"),
+            br#"{"main":"https://example.com"}"#,
+        )
+        .unwrap();
         assert!(LaunchPlan::new(&game, "", &runtime, &profile).is_err());
         fs::write(game.join("package.json"), br#"{"main":"index.html"}"#).unwrap();
         assert!(LaunchPlan::new(&game, "", &runtime, &game).is_err());
@@ -179,11 +208,16 @@ mod tests {
         symlink(game.join("index.html"), game.join("package.json")).unwrap();
         assert!(LaunchPlan::new(&game, "", &runtime, &profile).is_err());
         fs::remove_file(game.join("package.json")).unwrap();
-        let path = std::ffi::CString::new(game.join("package.json").as_os_str().as_encoded_bytes()).unwrap();
+        let path = std::ffi::CString::new(game.join("package.json").as_os_str().as_encoded_bytes())
+            .unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(LaunchPlan::new(&game, "", &runtime, &profile).is_err());
         fs::remove_file(game.join("package.json")).unwrap();
-        fs::write(game.join("package.json"), vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
+        fs::write(
+            game.join("package.json"),
+            vec![b' '; MAX_MANIFEST_BYTES as usize + 1],
+        )
+        .unwrap();
         assert!(LaunchPlan::new(&game, "", &runtime, &profile).is_err());
     }
 }

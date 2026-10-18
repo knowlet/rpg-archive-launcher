@@ -5,7 +5,9 @@
 //! CPU time is cumulative for the process, not a per-request timeout. Address
 //! space is not RSS; limits do not undo existing allocations. Exhaustion can
 //! abort/kill the host, so callers needing recovery must supervise a child.
-//! The macOS worker instead uses hard CPU limits and parent-sampled RSS, not a\n//! kernel-enforced memory ceiling.\n//! This is not a filesystem/network sandbox or protection from a privileged host
+//! The macOS worker instead uses hard CPU limits and parent-sampled RSS, not a
+//! kernel-enforced memory ceiling.
+//! This is not a filesystem/network sandbox or protection from a privileged host
 //! that deliberately changes limits. Other platforms are not validated.
 use std::io;
 

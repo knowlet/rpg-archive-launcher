@@ -17,7 +17,11 @@ pub fn macos_version_supported(version: &str, fskit: bool) -> bool {
         },
         None => 0,
     };
-    if fskit { (major, minor) >= (26, 4) } else { major >= 12 }
+    if fskit {
+        (major, minor) >= (26, 4)
+    } else {
+        major >= 12
+    }
 }
 
 pub fn macfuse_version_supported(version: &str) -> bool {
@@ -103,6 +107,9 @@ mod tests {
         assert!(validate_mountpoint(temp.path(), true).is_err());
         fs::write(temp.path().join("keep"), b"existing data").unwrap();
         assert!(validate_mountpoint(temp.path(), false).is_err());
-        assert_eq!(fs::read(temp.path().join("keep")).unwrap(), b"existing data");
+        assert_eq!(
+            fs::read(temp.path().join("keep")).unwrap(),
+            b"existing data"
+        );
     }
 }
