@@ -2,7 +2,7 @@
 name = "rpg-archive-launcher"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 description = "Experimental memory-only 7z resource reader and durable save overlay for RPG Maker games"
 license = "Apache-2.0"
 
