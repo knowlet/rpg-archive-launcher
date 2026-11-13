@@ -14,7 +14,7 @@ Coverage includes encrypted headers, Unicode passwords, wrong passwords, later s
 
 Fixtures are generated in tests from synthetic byte strings. Block-only CRC and unsupported stream-layout regressions additionally mutate parsed metadata to exercise the exact dependency integration edge cases. These are not claims that every third-party archive encoder has been covered.
 
-Official 7-Zip 26.04 interoperability subsequently passed 12 format/encryption combinations and 60 byte comparisons; see [the reproducible report](7zip-interoperability.md).
+Official 7-Zip 26.04 interoperability subsequently passed 12 format/encryption combinations and 60 byte comparisons; see [the reproducible report](7zip-interoperability.md). Linux CI downloads the same distribution with a pinned SHA-256 and runs `scripts/test_7zip_interop.py` after `cargo build --release --locked`.
 
 Not tested: arbitrary power-loss sector damage, disk-full injection, NAS disconnection, FUSE mounts, NW.js gameplay, macOS/Windows behavior, or production performance. The initial publication passed [GitHub Linux CI](https://github.com/knowlet/rpg-archive-launcher/actions/runs/39012104413) with 32 tests. The subsequent hardening and library guard below have 55 local tests; consult the PR checks for its exact remote status.
 
