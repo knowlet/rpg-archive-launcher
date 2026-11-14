@@ -69,10 +69,12 @@ pub fn validate_archive_path(name: &str) -> Result<()> {
             .next()
             .unwrap_or("")
             .to_ascii_uppercase();
-        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³"
+        ) || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
         {
             return Err(format!("reserved device path: {name:?}"));
         }
@@ -491,6 +493,46 @@ mod tests {
         }
         assert!(validate_archive_path("遊戲/data/Map001.json").is_ok());
     }
+    #[test]
+    fn rejects_superscript_device_paths() {
+        for prefix in ["COM", "com", "LPT", "lPt"] {
+            for digit in ['¹', '²', '³'] {
+                for name in [
+                    format!("{prefix}{digit}"),
+                    format!("data/{prefix}{digit}.json"),
+                    format!("{prefix}{digit}/data.json"),
+                ] {
+                    assert!(validate_archive_path(&name).is_err(), "{name:?}");
+                }
+            }
+        }
+        for name in [
+            "COM0",
+            "COM10",
+            "COM⁴",
+            "LPT¹extra",
+            "data/¹.json",
+            "遊戲/data.json",
+        ] {
+            assert!(validate_archive_path(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_superscript_device_entries_without_changing_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("device.7z");
+        for name in ["COM¹", "data/com².json", "LPT³/data.json"] {
+            fixture(&path, &[name], false);
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                Archive::open_fixture(&path, "", Limits::default()).is_err(),
+                "{name:?}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
     #[test]
     fn encrypted_header_unicode_and_wrong_password() {
         let temp = tempfile::tempdir().unwrap();

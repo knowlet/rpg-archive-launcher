@@ -77,10 +77,12 @@ pub fn validate_key(key: &str) -> io::Result<()> {
             .next()
             .unwrap_or("")
             .to_ascii_uppercase();
-        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || (stem.len() == 4
-                && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³"
+        ) || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
         if reserved {
             return Err(invalid("reserved save path component"));
         }
@@ -630,6 +632,46 @@ mod tests {
             assert!(validate_key(key).is_err(), "accepted {key:?}");
         }
         assert!(validate_key("Save/進度.json").is_ok());
+    }
+
+    #[test]
+    fn rejects_superscript_device_keys() {
+        for prefix in ["COM", "com", "LPT", "lPt"] {
+            for digit in ['¹', '²', '³'] {
+                for key in [
+                    format!("{prefix}{digit}"),
+                    format!("save/{prefix}{digit}.json"),
+                    format!("{prefix}{digit}/save.json"),
+                ] {
+                    assert!(validate_key(&key).is_err(), "{key:?}");
+                }
+            }
+        }
+        for key in [
+            "COM0",
+            "COM10",
+            "COM⁴",
+            "LPT¹extra",
+            "save/¹.json",
+            "Save/進度.json",
+        ] {
+            assert!(validate_key(key).is_ok(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_superscript_device_wal_without_rewriting_it() {
+        for key in ["COM¹", "save/com².json", "LPT³/save.json"] {
+            let temp = Temp::new();
+            drop(Store::open(temp.path()).unwrap());
+            let mut payload = vec![1];
+            encode_key(&mut payload, key);
+            payload.extend_from_slice(b"synthetic old save");
+            append_frame(&temp.path(), &payload);
+            let before = fs::read(temp.path()).unwrap();
+            assert!(Store::open(temp.path()).is_err(), "{key:?}");
+            assert_eq!(fs::read(temp.path()).unwrap(), before);
+        }
     }
 
     #[test]
