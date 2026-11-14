@@ -472,6 +472,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn default_wal_falls_back_when_launcher_subdir_not_writable() {
+        // Effective root can write through 0o555; the probe would not trigger fallback.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("game.7z");
