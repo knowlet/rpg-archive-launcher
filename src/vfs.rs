@@ -103,6 +103,26 @@ impl Overlay {
             .ok_or_else(|| "file not found".into())
     }
 
+    /// Visible file bytes if the path exists in Upper or the archive.
+    /// Returns `Ok(None)` when the path is tombstoned in Upper or absent from both layers.
+    /// Returns `Err` for decode, limit, or validation failures.
+    pub fn try_read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        self.contents(path, file_limit(path, None))
+    }
+
+    /// Replace the visible contents of an existing file in Upper.
+    pub fn replace_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        Self::validate(path)?;
+        let limit = file_limit(path, None);
+        if data.len() > limit {
+            return Err("file exceeds bounded Overlay buffer limit".into());
+        }
+        if !self.exists(path)? {
+            return Err("file not found".into());
+        }
+        self.upper.put(path, data).map_err(|e| e.to_string())
+    }
+
     pub fn read_at(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
         Self::validate(path)?;
         let limit = file_limit(path, None);
