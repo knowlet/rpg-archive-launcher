@@ -132,6 +132,7 @@ fn malformed_invocations_fail_cleanly() {
     assert!(cli(&["--help"], None).status.success());
     assert!(!cli(&["mount"], None).status.success());
     assert!(!cli(&["inspect"], None).status.success());
+    assert!(!cli(&["play"], None).status.success());
 }
 
 #[test]

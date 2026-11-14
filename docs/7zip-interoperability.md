@@ -34,4 +34,6 @@ In the reverse direction, official `7zz t` accepted the three-entry LZMA2 archiv
 
 ## Limits of this result
 
-This is a concrete compatibility matrix, not support for every 7z feature. Filters such as BCJ, split archives, SFX, alternative codecs, ambiguous filenames and unsupported interleaved streamless layouts remain unsupported. The matrix does not establish production latency, memory RSS bounds, NAS behavior or actual game playability.
+This is a concrete compatibility matrix, not support for every 7z feature. Filters such as BCJ, SFX, alternative codecs, ambiguous filenames and unsupported interleaved streamless layouts remain unsupported. The matrix does not establish production latency, memory RSS bounds, NAS behavior or actual game playability.
+
+**Split volumes (`.7z.001`, …):** the launcher discovers sibling parts in the same directory and exposes them to the decoder as one sequential byte stream (no member extraction). When `/tmp/7zz` from CI is present, `cargo test --test split_volumes` builds a tiny multi-volume archive and reads a member end-to-end. Formats outside 7-Zip’s `name.7z.NNN` naming pattern are not discovered yet.

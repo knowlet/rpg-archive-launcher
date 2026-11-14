@@ -5,8 +5,11 @@ The core stays separate from platform mounts and runtimes:
 - `archive`: index validation, encrypted 7z decode, bounded resource policy, memory cache.
 - `save`: a local append-only checksummed transaction log, single-writer lock, durable acknowledgement, tombstones and transactional rename.
 - `runtime`: metadata-only MV/MZ candidate detection.
+- `volumes`: split `.7z.NNN` discovery and sequential read/seek across parts.
+- `repair`: RPG Maker autofix transforms written into Upper during `play`.
+- `play`: bind Upper, detect runtime, apply repairs (no mount).
 - `vfs`: file-level Overlay byte operations with bounded whole-file buffers, copy-up on actual mutation, zero-filled growth, and atomic source tombstone + target data for lower renames.
-- CLI: inspection, stdout reads and explicit local-save operations. Linux address-space limit applies before archive parsing.
+- CLI: path-first `play`, inspection, stdout reads and explicit local-save operations. Linux address-space limit applies before archive parsing.
 
 Stable game identity is now separate from the accepted archive revision: the WAL stores a random 128-bit ID and a SHA-256 source revision. Overlay construction verifies that binding before serving contents. There is still no automatic game library or cross-device identity service.
 
