@@ -93,7 +93,16 @@ fn parse_volume_suffix_os(file_name: &OsStr) -> (OsString, Option<u32>) {
         #[cfg(unix)]
         let stem = OsStr::from_bytes(stem_bytes).to_os_string();
         #[cfg(not(unix))]
-        let stem = file_name.to_os_string();
+        let stem = match file_name.to_str() {
+            Some(text) => {
+                let (stem_str, detected) = parse_volume_suffix(text);
+                if detected != Some(num) {
+                    return (file_name.to_os_string(), None);
+                }
+                OsString::from(stem_str)
+            }
+            None => return (file_name.to_os_string(), None),
+        };
         return (stem, Some(num));
     }
     (file_name.to_os_string(), None)
@@ -317,6 +326,13 @@ impl Seek for VolumeChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_volume_suffix_os_strips_part_index_from_stem() {
+        let (stem, vol) = parse_volume_suffix_os(OsStr::new("Game.7z.001"));
+        assert_eq!(vol, Some(1));
+        assert_eq!(stem, OsString::from("Game.7z"));
+    }
 
     #[test]
     fn parses_split_suffix_and_discovers_siblings() {

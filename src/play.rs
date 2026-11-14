@@ -107,6 +107,27 @@ fn directory_is_writable(dir: &Path) -> bool {
         .is_ok()
 }
 
+fn beside_archive_wal_usable(archive: &Path) -> bool {
+    let archive_parent = archive.parent().unwrap_or_else(|| Path::new("."));
+    if !parent_allows_wal_dir(archive_parent) {
+        return false;
+    }
+    let launcher_dir = archive_parent.join(".rpg-archive-launcher");
+    if !launcher_dir.exists() {
+        return true;
+    }
+    if std::fs::symlink_metadata(&launcher_dir)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    if !launcher_dir.is_dir() {
+        return false;
+    }
+    directory_is_writable(&launcher_dir)
+}
+
 /// Default WAL path: archive-adjacent when writable, otherwise a per-user local directory.
 pub fn default_wal_path(archive: &Path) -> PathBuf {
     let label = crate::volumes::volume_set_label(archive);
@@ -119,8 +140,7 @@ pub fn default_wal_path(archive: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".rpg-archive-launcher");
-    let archive_parent = archive.parent().unwrap_or_else(|| Path::new("."));
-    if parent_allows_wal_dir(archive_parent) {
+    if beside_archive_wal_usable(archive) {
         beside_parent.join(filename)
     } else {
         user_local_wal_dir().join(filename)
@@ -447,5 +467,23 @@ mod tests {
         let wal = default_wal_path(&archive);
         assert!(wal.starts_with(temp.path()));
         assert!(wal.to_string_lossy().contains(".rpg-archive-launcher"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_wal_falls_back_when_launcher_subdir_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("game.7z");
+        std::fs::write(&archive, b"x").unwrap();
+        let launcher = temp.path().join(".rpg-archive-launcher");
+        std::fs::create_dir(&launcher).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let wal = default_wal_path(&archive);
+        assert!(
+            !wal.starts_with(&launcher),
+            "expected per-user fallback, got {}",
+            wal.display()
+        );
     }
 }
