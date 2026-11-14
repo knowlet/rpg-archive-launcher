@@ -1,8 +1,10 @@
 //! Split 7z volume discovery and sequential read/seek across sibling `.7z.NNN` parts.
 //!
 //! The decoder sees one logical byte stream; this does not unpack archive members to disk.
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -19,25 +21,29 @@ pub fn resolve_archive(path: &Path) -> Result<Vec<PathBuf>> {
             path.display()
         ));
     }
-    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-        return Ok(vec![path.to_path_buf()]);
-    };
-    let (stem, vol) = parse_volume_suffix(file_name);
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("archive path has no file name: {}", path.display()))?;
+    let (stem_os, vol) = parse_volume_suffix_os(file_name);
     if vol.is_some() {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut volumes = Vec::new();
         for index in 1..=999 {
-            let name = format!("{stem}.{index:03}");
+            let name = volume_part_name(&stem_os, index);
             let candidate = parent.join(&name);
             if !candidate.is_file() {
                 if index == 1 {
                     return Err(format!(
-                        "split volume {name} missing in {}",
+                        "split volume {} missing in {}",
+                        name.to_string_lossy(),
                         parent.display()
                     ));
                 }
-                if has_later_split_part(parent, stem, index) {
-                    return Err(format!("split volume gap: missing {name}"));
+                if has_later_split_part_os(parent, &stem_os, index) {
+                    return Err(format!(
+                        "split volume gap: missing {}",
+                        name.to_string_lossy()
+                    ));
                 }
                 break;
             }
@@ -51,8 +57,46 @@ pub fn resolve_archive(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![path.to_path_buf()])
 }
 
-fn has_later_split_part(parent: &Path, stem: &str, after: u32) -> bool {
-    (after + 1..=999).any(|index| parent.join(format!("{stem}.{index:03}")).is_file())
+fn volume_part_name(stem: &OsStr, index: u32) -> OsString {
+    let mut name = stem.to_os_string();
+    name.push(format!(".{index:03}"));
+    name
+}
+
+fn has_later_split_part_os(parent: &Path, stem: &OsStr, after: u32) -> bool {
+    (after + 1..=999).any(|index| parent.join(volume_part_name(stem, index)).is_file())
+}
+
+fn parse_volume_suffix_os(file_name: &OsStr) -> (OsString, Option<u32>) {
+    let bytes = file_name.as_encoded_bytes();
+    let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else {
+        return (file_name.to_os_string(), None);
+    };
+    if dot == 0 {
+        return (file_name.to_os_string(), None);
+    }
+    let suffix = &bytes[dot + 1..];
+    if suffix.len() != 3 || !suffix.iter().all(|b| b.is_ascii_digit()) {
+        return (file_name.to_os_string(), None);
+    }
+    let Ok(suffix_str) = std::str::from_utf8(suffix) else {
+        return (file_name.to_os_string(), None);
+    };
+    let Ok(num) = suffix_str.parse::<u32>() else {
+        return (file_name.to_os_string(), None);
+    };
+    if num < 1 {
+        return (file_name.to_os_string(), None);
+    }
+    let stem_bytes = &bytes[..dot];
+    if stem_bytes.ends_with(b".7z") || stem_bytes.ends_with(b".zip") {
+        #[cfg(unix)]
+        let stem = OsStr::from_bytes(stem_bytes).to_os_string();
+        #[cfg(not(unix))]
+        let stem = file_name.to_os_string();
+        return (stem, Some(num));
+    }
+    (file_name.to_os_string(), None)
 }
 
 /// Strip `.7z.NNN` or `.zip.NNN` style extensions for stable WAL naming.
@@ -111,18 +155,21 @@ impl VolumeChain {
         if paths.len() > 1 {
             let first_name = paths[0]
                 .file_name()
-                .and_then(OsStr::to_str)
-                .ok_or_else(|| "split volume path is not UTF-8".to_string())?;
-            let (stem, _) = parse_volume_suffix(first_name);
+                .ok_or_else(|| "split volume path has no file name".to_string())?;
+            let (stem_os, vol) = parse_volume_suffix_os(first_name);
+            if vol.is_none() {
+                return Err("split volume path missing part suffix".into());
+            }
             for (index, path) in paths.iter().enumerate() {
-                let expected = format!("{stem}.{:03}", index as u32 + 1);
+                let expected = volume_part_name(&stem_os, index as u32 + 1);
                 let actual = path
                     .file_name()
-                    .and_then(OsStr::to_str)
-                    .ok_or_else(|| format!("volume path is not UTF-8: {}", path.display()))?;
-                if actual != expected {
+                    .ok_or_else(|| format!("volume path has no file name: {}", path.display()))?;
+                if actual != expected.as_os_str() {
                     return Err(format!(
-                        "split volumes out of order: expected {expected}, got {actual}"
+                        "split volumes out of order: expected {}, got {}",
+                        expected.to_string_lossy(),
+                        actual.to_string_lossy()
                     ));
                 }
             }
@@ -362,6 +409,20 @@ mod tests {
         assert!(
             chain.seek(SeekFrom::Current(-10)).unwrap_err().kind() == io::ErrorKind::InvalidInput
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_split_volumes_with_non_utf8_stem_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let stem = OsStr::from_bytes(b"G\xe9me.7z");
+        for index in 1..=2 {
+            let name = volume_part_name(stem, index);
+            std::fs::write(temp.path().join(&name), format!("p{index}").as_bytes()).unwrap();
+        }
+        let first = temp.path().join(volume_part_name(stem, 1));
+        assert_eq!(resolve_archive(&first).unwrap().len(), 2);
     }
 
     #[test]

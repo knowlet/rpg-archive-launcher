@@ -103,7 +103,9 @@ impl Overlay {
             .ok_or_else(|| "file not found".into())
     }
 
-    /// Visible file bytes, or `None` when Upper tombstoned the path.
+    /// Visible file bytes if the path exists in Upper or the archive.
+    /// Returns `Ok(None)` when the path is tombstoned in Upper or absent from both layers.
+    /// Returns `Err` for decode, limit, or validation failures.
     pub fn try_read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
         self.contents(path, file_limit(path, None))
     }

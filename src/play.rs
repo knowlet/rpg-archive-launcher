@@ -87,7 +87,24 @@ fn parent_allows_wal_dir(parent: &Path) -> bool {
     {
         return false;
     }
-    parent.is_dir() && std::fs::OpenOptions::new().write(true).open(parent).is_ok()
+    if !parent.is_dir() {
+        return false;
+    }
+    directory_is_writable(parent)
+}
+
+/// Probe create/delete in the directory — opening a directory with `O_WRONLY` returns `EISDIR`.
+fn directory_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(
+        ".rpg-archive-launcher-write-probe-{}",
+        std::process::id()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|_| std::fs::remove_file(probe))
+        .is_ok()
 }
 
 /// Default WAL path: archive-adjacent when writable, otherwise a per-user local directory.
@@ -149,9 +166,7 @@ pub fn prepare(
     limits: Limits,
 ) -> Result<PlaySummary> {
     if let Some(parent) = wal.parent()
-        && parent
-            .file_name()
-            .is_some_and(|name| name == ".rpg-archive-launcher" || name == "rpg-archive-launcher")
+        && !parent.as_os_str().is_empty()
     {
         ensure_wal_parent(parent)?;
     }
@@ -203,16 +218,27 @@ pub fn prepare(
 
 fn effective_root(candidate_root: &str, names: &[String]) -> String {
     let root = candidate_root.trim_end_matches('/');
-    let has_engine = |prefix: &str| {
-        let mv = format!("{prefix}/js/rpg_core.js");
-        let mz = format!("{prefix}/js/rmmz_core.js");
+    let has_engine_under = |prefix: &str| {
+        let prefix = prefix.trim_end_matches('/');
+        let (mv, mz) = if prefix.is_empty() {
+            ("js/rpg_core.js".to_owned(), "js/rmmz_core.js".to_owned())
+        } else {
+            (
+                format!("{prefix}/js/rpg_core.js"),
+                format!("{prefix}/js/rmmz_core.js"),
+            )
+        };
         names.iter().any(|n| n == &mv || n == &mz)
     };
-    if has_engine(root) {
+    if has_engine_under(root) {
         return root.to_owned();
     }
-    let www = format!("{root}/www");
-    if has_engine(&www) {
+    let www = if root.is_empty() {
+        "www".to_owned()
+    } else {
+        format!("{root}/www")
+    };
+    if has_engine_under(&www) {
         return www;
     }
     root.to_owned()
@@ -228,7 +254,6 @@ pub fn apply_repairs(
         return Ok(RepairReport::default());
     };
     let mut report = RepairReport::default();
-    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
     if let Some(pkg_root) = package_root {
         let path = archive_relative_name(pkg_root, "package.json");
         if names.iter().any(|n| n == &path)
@@ -237,7 +262,10 @@ pub fn apply_repairs(
             && let Some(patched) = fix_package_name(text)
         {
             report.package_name_set_www = true;
-            pending.push((path, patched.into_bytes()));
+            let bytes = patched.into_bytes();
+            if bytes != original {
+                overlay.replace_file(&path, &bytes)?;
+            }
         }
     }
     let rel_targets = [
@@ -267,7 +295,7 @@ pub fn apply_repairs(
             RepairKind::Pixi => report.pixi_sourcemap_strips += count,
         }
         if patched.as_bytes() != original.as_slice() {
-            pending.push((path, patched.into_bytes()));
+            overlay.replace_file(&path, patched.as_bytes())?;
         }
     }
     let data_prefix = archive_relative_name(game_root, "data/");
@@ -284,11 +312,8 @@ pub fn apply_repairs(
         let (patched, count) = strip_achievement_calls_json(text);
         report.data_achievement_strips += count;
         if patched.as_bytes() != original.as_slice() {
-            pending.push((name.to_owned(), patched.into_bytes()));
+            overlay.replace_file(name, patched.as_bytes())?;
         }
-    }
-    for (path, bytes) in pending {
-        overlay.replace_file(&path, &bytes)?;
     }
     Ok(report)
 }
@@ -406,5 +431,21 @@ mod tests {
         ]
         .map(str::to_owned);
         assert_eq!(effective_root("Game/", &names), "Game");
+    }
+
+    #[test]
+    fn effective_root_uses_www_for_rootless_mv_layout() {
+        let names = ["package.json", "www/js/rpg_core.js", "www/js/plugins.js"].map(str::to_owned);
+        assert_eq!(effective_root("", &names), "www");
+    }
+
+    #[test]
+    fn default_wal_stays_beside_writable_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("game.7z");
+        std::fs::write(&archive, b"x").unwrap();
+        let wal = default_wal_path(&archive);
+        assert!(wal.starts_with(temp.path()));
+        assert!(wal.to_string_lossy().contains(".rpg-archive-launcher"));
     }
 }
