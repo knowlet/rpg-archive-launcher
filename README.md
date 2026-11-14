@@ -4,7 +4,7 @@ An experimental Rust core for reading encrypted 7z RPG Maker resources in memory
 
 **Status: CLI play preparation + overlay repairs; no filesystem mount or NW.js execution yet.** Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
 
-## Friendly play entry (Mac/Linux CLI)
+## Friendly play entry (Linux CLI)
 
 Pass an archive path directly (no subcommand), or use `play` / `run`:
 
@@ -18,7 +18,7 @@ cargo build --release --locked
 `play`:
 
 1. Opens the archive (or full `.7z.001` + sibling volume set) read-only in memory.
-2. Creates or reopens a local Upper WAL (default: `.rpg-archive-launcher/<label>.wal` next to the archive).
+2. Creates or reopens a local Upper WAL (default: archive-adjacent `.rpg-archive-launcher/<label>-<id>.wal`, or a per-user local directory when the archive parent is not writable). For NAS or shared storage, pass an explicit private `--wal` path.
 3. Applies RPG Maker **overlay repairs** (OrangeGreenworks, MPP_MessageEX, pixi map, package.json, achievement calls) into Upper only.
 4. Prints runtime detection and next steps. It does **not** mount FUSE/FSKit or launch NW.js.
 

@@ -11,7 +11,8 @@ fn official_split_archive_opens_via_volume_chain() {
     }
     isolation::install_process_limits().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("payload.bin"), b"hello split fixtures").unwrap();
+    let payload = vec![b'x'; 6 * 1024];
+    std::fs::write(temp.path().join("payload.bin"), &payload).unwrap();
     let base = temp.path().join("split.7z");
     assert!(
         Command::new("/tmp/7zz")
@@ -20,6 +21,7 @@ fn official_split_archive_opens_via_volume_chain() {
                 "a",
                 "-v5k",
                 "-y",
+                "-mx=0",
                 base.file_name().unwrap().to_str().unwrap(),
                 "payload.bin",
             ])
@@ -33,9 +35,13 @@ fn official_split_archive_opens_via_volume_chain() {
         return;
     }
     let mut archive = Archive::open(&first, "", Limits::default()).unwrap();
-    assert!(archive.volume_paths().len() > 1);
+    assert!(
+        archive.volume_paths().len() > 1,
+        "expected multiple volumes, got {}",
+        archive.volume_paths().len()
+    );
     let data = archive
         .read("payload.bin")
         .expect("decode split volume member");
-    assert_eq!(data, b"hello split fixtures");
+    assert_eq!(data, payload);
 }

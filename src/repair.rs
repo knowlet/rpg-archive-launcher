@@ -57,7 +57,7 @@ pub fn strip_achievement_calls_json(content: &str) -> (String, usize) {
                     {
                         for entry in params.iter_mut() {
                             if let Value::String(text) = entry {
-                                let stripped = ACHIEVEMENT_CALL.replace_all(text, "");
+                                let stripped = ACHIEVEMENT_CALL.replace_all(text, "void 0;");
                                 if stripped.len() != text.len() {
                                     *changes += 1;
                                     *text = stripped.into_owned();
@@ -80,7 +80,7 @@ pub fn strip_achievement_calls_json(content: &str) -> (String, usize) {
     if changes == 0 {
         return (content.to_owned(), 0);
     }
-    let out = serde_json::to_string_pretty(&value).unwrap_or_else(|_| content.to_owned());
+    let out = serde_json::to_string(&value).unwrap_or_else(|_| content.to_owned());
     (out, changes)
 }
 
@@ -104,6 +104,9 @@ pub fn fix_mpp_color_index(content: &str) -> (String, usize) {
             }
         }
         index += 1;
+    }
+    if moves == 0 {
+        return (content.to_owned(), 0);
     }
     let trailing_newline = content.ends_with('\n');
     let mut out = lines.join("\n");
@@ -133,7 +136,7 @@ pub fn fix_package_name(content: &str) -> Option<String> {
         return None;
     }
     map.insert("name".to_owned(), Value::String("www".to_owned()));
-    serde_json::to_string_pretty(&value).ok()
+    serde_json::to_string(&value).ok()
 }
 
 pub fn archive_relative_name(game_root: &str, rel: &str) -> String {
@@ -154,11 +157,7 @@ mod tests {
         let input = r#"{ "plugins": [ { "name":"OrangeGreenworks", "status":true } ] }"#;
         let (out, n) = fix_plugins_js(input);
         assert!(n >= 1);
-        assert!(
-            out.contains("\"status\":false")
-                || out.contains("'status':false")
-                || out.contains("false")
-        );
+        assert!(out.contains("\"status\":false"));
         assert!(!out.contains("\"status\":true"));
     }
 
@@ -168,6 +167,7 @@ mod tests {
         let (out, n) = strip_achievement_calls_json(input);
         assert_eq!(n, 1);
         assert!(!out.contains("activateAchievement"));
+        assert!(out.contains("void 0;"));
     }
 
     #[test]
@@ -193,6 +193,6 @@ mod tests {
         let Some(out) = fix_package_name(r#"{"name":""}"#) else {
             panic!("expected change");
         };
-        assert!(out.contains("\"name\": \"www\""));
+        assert!(out.contains("\"name\":\"www\"") || out.contains("\"name\": \"www\""));
     }
 }

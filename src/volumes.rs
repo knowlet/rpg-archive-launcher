@@ -6,6 +6,7 @@ use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 type Result<T> = std::result::Result<T, String>;
@@ -18,23 +19,25 @@ pub fn resolve_archive(path: &Path) -> Result<Vec<PathBuf>> {
             path.display()
         ));
     }
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| format!("non-UTF-8 archive name: {}", path.display()))?;
+    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+        return Ok(vec![path.to_path_buf()]);
+    };
     let (stem, vol) = parse_volume_suffix(file_name);
-    if let Some(start) = vol {
+    if vol.is_some() {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut volumes = Vec::new();
-        for index in start..=999 {
+        for index in 1..=999 {
             let name = format!("{stem}.{index:03}");
             let candidate = parent.join(&name);
             if !candidate.is_file() {
-                if index == start {
+                if index == 1 {
                     return Err(format!(
                         "split volume {name} missing in {}",
                         parent.display()
                     ));
+                }
+                if has_later_split_part(parent, stem, index) {
+                    return Err(format!("split volume gap: missing {name}"));
                 }
                 break;
             }
@@ -48,17 +51,21 @@ pub fn resolve_archive(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![path.to_path_buf()])
 }
 
+fn has_later_split_part(parent: &Path, stem: &str, after: u32) -> bool {
+    (after + 1..=999).any(|index| parent.join(format!("{stem}.{index:03}")).is_file())
+}
+
 /// Strip `.7z.NNN` or `.zip.NNN` style extensions for stable WAL naming.
 pub fn volume_set_label(path: &Path) -> String {
     let file_name = path
         .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("archive");
-    let (stem, vol) = parse_volume_suffix(file_name);
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".into());
+    let (stem, vol) = parse_volume_suffix(&file_name);
     if vol.is_some() {
         stem.to_string()
     } else {
-        file_name.to_string()
+        file_name
     }
 }
 
@@ -82,9 +89,16 @@ fn parse_volume_suffix(file_name: &str) -> (&str, Option<u32>) {
 }
 
 #[derive(Debug)]
+struct VolumeSnapshot {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug)]
 pub struct VolumeChain {
     files: Vec<File>,
     lengths: Vec<u64>,
+    snapshots: Vec<VolumeSnapshot>,
     total: u64,
     position: u64,
 }
@@ -94,8 +108,28 @@ impl VolumeChain {
         if paths.is_empty() {
             return Err("no volume paths".into());
         }
+        if paths.len() > 1 {
+            let first_name = paths[0]
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| "split volume path is not UTF-8".to_string())?;
+            let (stem, _) = parse_volume_suffix(first_name);
+            for (index, path) in paths.iter().enumerate() {
+                let expected = format!("{stem}.{:03}", index as u32 + 1);
+                let actual = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| format!("volume path is not UTF-8: {}", path.display()))?;
+                if actual != expected {
+                    return Err(format!(
+                        "split volumes out of order: expected {expected}, got {actual}"
+                    ));
+                }
+            }
+        }
         let mut files = Vec::with_capacity(paths.len());
         let mut lengths = Vec::with_capacity(paths.len());
+        let mut snapshots = Vec::with_capacity(paths.len());
         let mut total = 0u64;
         for path in paths {
             let mut options = std::fs::OpenOptions::new();
@@ -117,11 +151,16 @@ impl VolumeChain {
                 .checked_add(len)
                 .ok_or_else(|| "volume set size overflow".to_string())?;
             lengths.push(len);
+            snapshots.push(VolumeSnapshot {
+                len,
+                modified: meta.modified().ok(),
+            });
             files.push(file);
         }
         Ok(Self {
             files,
             lengths,
+            snapshots,
             total,
             position: 0,
         })
@@ -136,10 +175,10 @@ impl VolumeChain {
     }
 
     pub fn volume_metadata_unchanged(&self) -> io::Result<()> {
-        for (file, &expected_len) in self.files.iter().zip(&self.lengths) {
+        for (file, snap) in self.files.iter().zip(&self.snapshots) {
             let meta = file.metadata()?;
-            if !meta.is_file() || meta.len() != expected_len {
-                return Err(io::Error::other("split volume set changed size"));
+            if !meta.is_file() || meta.len() != snap.len || meta.modified().ok() != snap.modified {
+                return Err(io::Error::other("split volume set changed on disk"));
             }
         }
         Ok(())
@@ -194,16 +233,26 @@ impl Seek for VolumeChain {
             SeekFrom::Start(p) => p,
             SeekFrom::End(delta) => {
                 if delta >= 0 {
-                    self.total.saturating_add(delta as u64)
+                    self.total.checked_add(delta as u64).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek overflow")
+                    })?
                 } else {
-                    self.total.saturating_sub(delta.unsigned_abs())
+                    let magnitude = delta.unsigned_abs();
+                    self.total.checked_sub(magnitude).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek before start")
+                    })?
                 }
             }
             SeekFrom::Current(delta) => {
                 if delta >= 0 {
-                    self.position.saturating_add(delta as u64)
+                    self.position.checked_add(delta as u64).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek overflow")
+                    })?
                 } else {
-                    self.position.saturating_sub(delta.unsigned_abs())
+                    let magnitude = delta.unsigned_abs();
+                    self.position.checked_sub(magnitude).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "seek before start")
+                    })?
                 }
             }
         };
@@ -246,6 +295,36 @@ mod tests {
     }
 
     #[test]
+    fn resolving_from_later_part_starts_at_first_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("Game.7z.001", b"part1"),
+            ("Game.7z.002", b"part2"),
+            ("Game.7z.003", b"part3"),
+        ] {
+            std::fs::write(temp.path().join(name), body).unwrap();
+        }
+        let resolved = resolve_archive(&temp.path().join("Game.7z.002")).unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(
+            resolved[0].file_name().unwrap().to_str().unwrap(),
+            "Game.7z.001"
+        );
+    }
+
+    #[test]
+    fn detects_gap_in_split_numbering() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Game.7z.001"), b"a").unwrap();
+        std::fs::write(temp.path().join("Game.7z.003"), b"c").unwrap();
+        assert!(
+            resolve_archive(&temp.path().join("Game.7z.001"))
+                .unwrap_err()
+                .contains("gap")
+        );
+    }
+
+    #[test]
     fn single_seven_z_path_is_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("solo.7z");
@@ -271,5 +350,31 @@ mod tests {
         let mut slice = [0u8; 3];
         chain.read_exact(&mut slice).unwrap();
         assert_eq!(&slice, b"vol");
+    }
+
+    #[test]
+    fn seek_before_start_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("solo.7z");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let mut chain = VolumeChain::open(&[path]).unwrap();
+        chain.seek(SeekFrom::Start(3)).unwrap();
+        assert!(
+            chain.seek(SeekFrom::Current(-10)).unwrap_err().kind() == io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_order_chain_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("Game.7z.001");
+        let second = temp.path().join("Game.7z.002");
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"b").unwrap();
+        assert!(
+            VolumeChain::open(&[second, first])
+                .unwrap_err()
+                .contains("out of order")
+        );
     }
 }

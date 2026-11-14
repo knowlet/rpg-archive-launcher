@@ -132,10 +132,10 @@ fn run_play(archive: &Path, wal: &Path, encrypted: bool) -> Result<(), Box<dyn s
     println!(
         "runtime launch: NW.js not bundled; overlay-read and future mount will expose contents"
     );
+    let password_flag = if encrypted { " --password-stdin" } else { "" };
     println!(
-        "next: overlay-read {} {} <entry>",
-        archive.display(),
-        summary.wal_path.display()
+        "next: overlay-read {:?} {:?} <entry>{password_flag}",
+        archive, summary.wal_path
     );
     Ok(())
 }
@@ -170,6 +170,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args[0] = "play".into();
     }
     if args[0] == "play" {
+        if args
+            .get(1)
+            .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
+        {
+            print!("{HELP}");
+            return Ok(());
+        }
         let (archive, wal, encrypted) = parse_play_args(&args)?;
         return run_play(&archive, &wal, encrypted);
     }

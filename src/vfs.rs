@@ -103,6 +103,11 @@ impl Overlay {
             .ok_or_else(|| "file not found".into())
     }
 
+    /// Visible file bytes, or `None` when Upper tombstoned the path.
+    pub fn try_read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        self.contents(path, file_limit(path, None))
+    }
+
     /// Replace the visible contents of an existing file in Upper.
     pub fn replace_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
         Self::validate(path)?;
