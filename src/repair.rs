@@ -23,8 +23,10 @@ static WINDOW_INIT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Window_Base\.prototype\.initialize\.call\s*\(.*\)").unwrap());
 static COLOR_INDEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"this\._colorIndex\s*=\s*0\s*;").unwrap());
-static PIXI_MAP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"//# sourceMappingURL=pixi\.js\.map\s*\n?").unwrap());
+// Match only the complete final annotation line, not arbitrary substrings.
+static PIXI_MAP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ \t]*//# sourceMappingURL=pixi\.js\.map[ \t]*(?:\r?\n)?\z").unwrap()
+});
 
 pub fn is_apple_double(name: &str) -> bool {
     name.split('/')
@@ -186,6 +188,35 @@ mod tests {
         let (out, n) = remove_pixi_sourcemap(input);
         assert_eq!(n, 1);
         assert!(!out.contains("sourceMappingURL"));
+    }
+
+    #[test]
+    fn pixi_map_repair_preserves_code_and_other_map_names() {
+        for input in [
+            r#"const example = "//# sourceMappingURL=pixi.js.map";"#,
+            "//# sourceMappingURL=pixi.js.map.backup\n",
+            "//# sourceMappingURL=pixi.js.map?debug=1\n",
+            "console.log(1); //# sourceMappingURL=pixi.js.map\n",
+            "//# sourceMappingURL=pixi.js.map\nrun();\n",
+            "const text = `\n//# sourceMappingURL=pixi.js.map\n`;\n",
+        ] {
+            assert_eq!(remove_pixi_sourcemap(input), (input.to_owned(), 0));
+        }
+    }
+
+    #[test]
+    fn pixi_map_repair_preserves_line_boundaries_and_is_idempotent() {
+        for newline in ["\n", "\r\n"] {
+            let input = format!("run();{newline}  //# sourceMappingURL=pixi.js.map \t{newline}");
+            let (out, count) = remove_pixi_sourcemap(&input);
+            assert_eq!(count, 1);
+            assert_eq!(out, format!("run();{newline}"));
+            assert_eq!(remove_pixi_sourcemap(&out), (out, 0));
+        }
+        assert_eq!(
+            remove_pixi_sourcemap("//# sourceMappingURL=pixi.js.map").1,
+            1
+        );
     }
 
     #[test]

@@ -377,7 +377,7 @@ mod tests {
             ),
             (
                 "Game/www/js/libs/pixi.js",
-                b"//game\n//# sourceMappingURL=pixi.js.map\n",
+                b"const example = \"//# sourceMappingURL=pixi.js.map\";\n//# sourceMappingURL=pixi.js.map\n",
             ),
             (
                 "Game/www/data/Map001.json",
@@ -413,7 +413,11 @@ mod tests {
             apply_repairs(&mut overlay, Some(&game_root), Some(&package_root), &names).unwrap();
         assert!(report.plugins_greenworks_disabled >= 1);
         assert!(report.mpp_color_index_moves >= 1);
-        assert!(report.pixi_sourcemap_strips >= 1);
+        assert_eq!(report.pixi_sourcemap_strips, 1);
+        assert_eq!(
+            overlay.read_file("Game/www/js/libs/pixi.js").unwrap(),
+            b"const example = \"//# sourceMappingURL=pixi.js.map\";\n"
+        );
         assert!(report.data_achievement_strips >= 1);
         assert!(report.package_name_set_www);
         let plugins = overlay.read_file("Game/www/js/plugins.js").unwrap();
