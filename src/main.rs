@@ -50,7 +50,7 @@ fn parse_play_args(
         return Err(fail("play requires ARCHIVE; use --help"));
     }
     let archive = PathBuf::from(&args[1]);
-    let mut wal = default_wal_path(&archive);
+    let mut wal = None;
     let mut encrypted = false;
     let mut index = 2;
     while index < args.len() {
@@ -59,7 +59,7 @@ fn parse_play_args(
                 let Some(path) = args.get(index + 1) else {
                     return Err(fail("--wal requires a path"));
                 };
-                wal = PathBuf::from(path);
+                wal = Some(PathBuf::from(path));
                 index += 2;
             }
             "--password-stdin" => {
@@ -69,6 +69,9 @@ fn parse_play_args(
             other => return Err(fail(format!("unknown play flag: {other}"))),
         }
     }
+    // Choosing the default can create and remove a write probe next to the
+    // archive. Do so only for valid invocations without an explicit WAL.
+    let wal = wal.unwrap_or_else(|| default_wal_path(&archive));
     Ok((archive, wal, encrypted))
 }
 
