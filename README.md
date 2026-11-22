@@ -8,21 +8,44 @@
 
 An experimental Rust core for reading encrypted 7z RPG Maker resources in memory and keeping user changes in a durable, separate local Upper store.
 
-**Status: first CLI/core prototype, not a playable launcher.** There is no filesystem mount or NW.js execution yet. Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
+**Status: Linux CLI play preparation, overlay repairs, and an optional read-only FUSE probe.** `play` does not mount or launch NW.js. Real macOS mounts and NW.js gameplay are not accepted. Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
+
+## Friendly play entry (Linux CLI)
+
+Pass an archive path directly (no subcommand), or use `play` / `run`:
+
+```sh
+cargo build --release --locked
+./target/release/rpg-archive-launcher '/path/to/Game.7z'
+./target/release/rpg-archive-launcher '/path/to/Game.7z.001'   # split volumes
+./target/release/rpg-archive-launcher play Game.7z --wal ~/.rpg-launcher/game.wal
+```
+
+`play`:
+
+1. Opens the archive (or full `.7z.001` + sibling volume set) read-only in memory.
+2. Creates or reopens a local Upper WAL (default: archive-adjacent `.rpg-archive-launcher/<label>-<id>.wal`, or a per-user local directory when the archive parent is not writable). For NAS or shared storage, pass an explicit private `--wal` path.
+3. Applies RPG Maker **overlay repairs** (OrangeGreenworks, MPP_MessageEX, pixi map, package.json, achievement calls) into Upper only.
+4. Prints runtime detection and next steps. It does **not** mount FUSE/FSKit or launch NW.js.
+
+Encrypted archives: append `--password-stdin` and supply one UTF-8 line on stdin.
 
 ## What works in this slice
 
-- Inspect single 7z archives and identify MV/MZ runtime candidates from metadata.
+- **Path-first CLI** plus `play` / `run` alongside existing low-level subcommands.
+- **Split 7z volumes**: open `*.7z.001` and stream all sibling parts as one archive (no full extract).
+- **RPG Maker autofix** as Upper patches (immutable archive unchanged); `www/` preferred; `._*` AppleDouble paths skipped for data JSON repairs.
+- Inspect single or split archives and identify MV/MZ runtime candidates from metadata.
 - Read an entry to memory/stdout, with bounded resource policies and no extraction directory.
 - Persist local save data, tombstones and atomic save renames in a single-writer log.
 - Read Upper first, then immutable archive contents with `overlay-read`.
 - Bounded byte-range reads, partial writes with copy-up, zero-filled holes, truncate, unlink and atomic lower-file rename. Read operations never copy resource payloads into Upper.
-- Synthetic archive tests and save-store recovery tests; no commercial game data required.
-- [Official 7-Zip 26.04 interoperability](docs/7zip-interoperability.md): 12 combinations and 60 byte comparisons passed.
+- Synthetic archive tests, repair transform tests, volume discovery tests, and save-store recovery tests; no commercial game data required.
+- [Official 7-Zip 26.04 interoperability](docs/7zip-interoperability.md): 12 combinations and 60 byte comparisons passed; optional split-volume smoke test when `7zz` is available.
 
 Original archives are opened read-only. There is no automatic archive update, NAS sync, full-extraction fallback, runtime download or game execution.
 
-## Build and use
+## Build and use (low-level)
 
 Install a current stable Rust toolchain from [rustup.rs](https://rustup.rs), then:
 
@@ -32,6 +55,7 @@ cargo build --release --locked
 cargo run --example make_demo -- demo.7z
 cargo run -- inspect demo.7z
 cargo run -- read demo.7z data/System.json
+cargo run -- play demo.7z --wal /private/local/path/game.wal
 cargo run -- overlay-bind demo.7z /private/local/path/game.wal
 cargo run -- save-put /private/local/path/game.wal save/file1.rpgsave ./new-save
 cargo run -- overlay-read demo.7z /private/local/path/game.wal save/file1.rpgsave
@@ -52,7 +76,7 @@ Encrypted archives accept a single UTF-8 password line via stdin with `--passwor
 - Public archive library access and CLI are currently Linux-only: a 512 MiB process virtual-address-space ceiling is applied before parsing untrusted headers. This is not an RSS guarantee or sandbox. Allocation exhaustion can terminate the process. A 120-second CPU-time ceiling also applies, including malicious header key derivation; large solid reads may hit it. `Archive::open` fails before opening/parsing unless both hard ceilings are already installed. The CLI opts in explicitly; embedding applications must use a dedicated limited host rather than silently limiting their GUI/server. CPU accounting is cumulative across all host threads and requests. Existing allocations are not removed by lowering limits. See [the library resource contract](docs/architecture.md#library-resource-contract).
 - Entry, dictionary and cache limits are reported by `inspect`; unsupported layouts/codecs are rejected, not silently extracted.
 - Large solid blocks can require decoding preceding files repeatedly. This prototype is not the final block-coalescing scheduler and does not claim acceptable game latency.
-- Each Overlay WAL binds a random stable game ID to the SHA-256 of its accepted immutable archive revision. Different archives/revisions fail closed; binding requires a new empty WAL. Existing populated legacy WALs are not automatically migrated. Opening an Overlay reads the entire source archive to verify its digest, including across NAS; see the [binding policy](docs/architecture.md#archive-binding-policy).
+- Each Overlay WAL binds a random stable game ID to the SHA-256 of its accepted immutable archive revision (concatenated across split volumes). Different archives/revisions fail closed; binding requires a new empty WAL. Existing populated legacy WALs are not automatically migrated. Opening an Overlay reads the entire source archive to verify its digest, including across NAS; see the [binding policy](docs/architecture.md#archive-binding-policy).
 - Upper is **plaintext**. Keep its log in a private, trusted directory on a local filesystem. Source archive encryption does not encrypt saves.
 - Save persistence is separate from “synced to NAS” and “merged into archive.” Neither latter operation exists yet.
 - Upper currently requires Unix filesystem semantics and fails closed on other systems. Upper WAL must not be shared over SMB/NAS between active devices. One writer is enforced locally; cross-device coordination is not implemented.
@@ -63,13 +87,13 @@ Encrypted archives accept a single UTF-8 password line via stdin with `--passwor
 ## Planned acceptance gates
 
 1. Benchmark cold/warm solid block reads, decode amplification and peak RSS against official 7-Zip fixtures.
-2. Linux FUSE adapter, with ordinary file operations and runtime lifecycle tests.
+2. Accepted Linux FUSE gameplay, beyond the optional read-only `mount-ro` probe.
 3. macOS Apple Silicon FSKit/macFUSE probe and actual MV/MZ play/save/reopen tests.
 4. Persistent save snapshots, conflict branches, interrupted-operation recovery and opt-in validated archive commit.
 5. Independent Windows WinFsp semantics and playability tests.
 6. Tauri management UI, isolated from game content.
 
-This environment has no `/dev/fuse`, NW.js install or macOS/Windows host. Mounting and playability have not been tested. See [design notes](docs/architecture.md).
+Real macOS mounts, NW.js gameplay, and hosts without `/dev/fuse` are unverified. `play` prepares overlay state only. Optional `mount-ro` is a read-only probe. See [design notes](docs/architecture.md) and [the macOS probe limits](docs/macos-playability.md).
 
 ## License
 

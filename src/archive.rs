@@ -3,12 +3,13 @@
 //! Encoded headers are parsed by the dependency before their metadata is available:
 //! `open` rejects hosts without the Linux hard process ceilings in `isolation`.
 //! This is process resource containment, not a sandbox or a recoverable decoder worker.
+use crate::volumes::{VolumeChain, resolve_archive};
 use sevenz_rust2::{Archive as Metadata, BlockDecoder, Password};
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -32,9 +33,58 @@ impl Default for Limits {
     }
 }
 
+enum OpenedSource {
+    File(File),
+    Volumes(VolumeChain),
+}
+
+impl Read for OpenedSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            OpenedSource::File(file) => file.read(buf),
+            OpenedSource::Volumes(chain) => chain.read(buf),
+        }
+    }
+}
+
+impl Seek for OpenedSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            OpenedSource::File(file) => file.seek(pos),
+            OpenedSource::Volumes(chain) => chain.seek(pos),
+        }
+    }
+}
+
+impl OpenedSource {
+    fn open_single(path: &Path) -> Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("archive source must be a regular file".into());
+        }
+        Ok(OpenedSource::File(file))
+    }
+
+    fn stream_position(&mut self) -> Result<u64> {
+        Ok(match self {
+            OpenedSource::File(file) => file.stream_position().map_err(|e| e.to_string())?,
+            OpenedSource::Volumes(chain) => chain.logical_position(),
+        })
+    }
+}
+
 pub struct Archive {
-    source: File,
-    source_stamp: SourceStamp,
+    source: OpenedSource,
+    /// Inode stamp for a single file. Split volumes use `VolumeChain` snapshots.
+    source_stamp: Option<SourceStamp>,
+    volume_paths: Vec<PathBuf>,
     metadata: Metadata,
     password: Password,
     limits: Limits,
@@ -121,8 +171,11 @@ pub fn validate_archive_path(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn header_preflight(file: &mut File) -> Result<()> {
-    let len = file.metadata().map_err(|e| e.to_string())?.len();
+fn header_preflight(file: &mut OpenedSource) -> Result<()> {
+    let len = match file {
+        OpenedSource::File(f) => f.metadata().map_err(|e| e.to_string())?.len(),
+        OpenedSource::Volumes(chain) => chain.total_len(),
+    };
     let mut header = [0; 32];
     file.read_exact(&mut header)
         .map_err(|e| format!("7z signature: {e}"))?;
@@ -215,7 +268,8 @@ impl Archive {
     /// before loading untrusted input. This method never changes host limits.
     pub fn open(path: impl AsRef<Path>, password: &str, limits: Limits) -> Result<Self> {
         crate::isolation::require_process_limits().map_err(|e| e.to_string())?;
-        Self::open_inner(path, password, limits)
+        let volumes = resolve_archive(path.as_ref())?;
+        Self::open_volumes(&volumes, password, limits)
     }
 
     /// Available only inside the dedicated supervised decoder child.
@@ -227,7 +281,8 @@ impl Archive {
         permit: &crate::worker::WorkerPermit,
     ) -> Result<Self> {
         permit.verify()?;
-        Self::open_inner(path, password, limits)
+        let volumes = resolve_archive(path.as_ref())?;
+        Self::open_volumes(&volumes, password, limits)
     }
 
     // Unit fixtures test parser semantics without changing the parallel test
@@ -239,27 +294,22 @@ impl Archive {
         password: &str,
         limits: Limits,
     ) -> Result<Self> {
-        Self::open_inner(path, password, limits)
+        Self::open_volumes(&[path.as_ref().to_path_buf()], password, limits)
     }
 
-    fn open_inner(path: impl AsRef<Path>, password: &str, limits: Limits) -> Result<Self> {
+    fn open_volumes(paths: &[PathBuf], password: &str, limits: Limits) -> Result<Self> {
         if limits.max_file_bytes > usize::MAX as u64 || limits.max_cache_bytes > usize::MAX as u64 {
             return Err("memory limits exceed platform address size".into());
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        // Open first, then inspect the same descriptor to avoid a path-check race.
-        // NONBLOCK ensures a malicious FIFO cannot hang us before fstat.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NONBLOCK);
-        }
-        let mut source = options.open(path).map_err(|e| e.to_string())?;
-        if !source.metadata().map_err(|e| e.to_string())?.is_file() {
-            return Err("archive source must be a regular file".into());
-        }
-        let source_stamp = source_stamp(&source)?;
+        let mut source = if paths.len() == 1 {
+            OpenedSource::open_single(&paths[0])?
+        } else {
+            OpenedSource::Volumes(VolumeChain::open(paths)?)
+        };
+        let source_stamp = match &source {
+            OpenedSource::File(file) => Some(source_stamp(file)?),
+            OpenedSource::Volumes(_) => None,
+        };
         header_preflight(&mut source)?;
         let password = Password::new(password);
         // Metadata::read uses one decoding thread, including encrypted headers.
@@ -342,6 +392,7 @@ impl Archive {
         Ok(Self {
             source,
             source_stamp,
+            volume_paths: paths.to_owned(),
             metadata,
             password,
             limits,
@@ -349,6 +400,10 @@ impl Archive {
             explicit_directories,
             cache: None,
         })
+    }
+
+    pub fn volume_paths(&self) -> &[PathBuf] {
+        &self.volume_paths
     }
 
     /// Explicit directory records and their ancestors remain directories even
@@ -417,10 +472,23 @@ impl Archive {
     }
 
     pub(crate) fn ensure_source_unchanged(&self) -> Result<()> {
-        if source_stamp(&self.source)? != self.source_stamp {
-            return Err(
-                "archive source changed after opening; reopen against a new revision".into(),
-            );
+        match &self.source {
+            OpenedSource::File(file) => {
+                let Some(stamp) = &self.source_stamp else {
+                    return Err("archive source stamp missing".into());
+                };
+                if &source_stamp(file)? != stamp {
+                    return Err(
+                        "archive source changed after opening; reopen against a new revision"
+                            .into(),
+                    );
+                }
+            }
+            OpenedSource::Volumes(chain) => {
+                chain
+                    .volume_metadata_unchanged()
+                    .map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     }
@@ -456,7 +524,7 @@ impl Archive {
     pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
         use sha2::{Digest, Sha256};
         self.ensure_source_unchanged()?;
-        let position = self.source.stream_position().map_err(|e| e.to_string())?;
+        let position = self.source.stream_position()?;
         self.source
             .seek(SeekFrom::Start(0))
             .map_err(|e| e.to_string())?;
@@ -771,14 +839,15 @@ mod tests {
         bytes[..6].copy_from_slice(b"7z\xbc\xaf\x27\x1c");
         bytes[20..28].copy_from_slice(&(9u64 << 20).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         file.set_len(32 + (9 << 20)).unwrap();
+        let mut source = OpenedSource::File(file);
         assert!(
-            header_preflight(&mut file)
+            header_preflight(&mut source)
                 .unwrap_err()
                 .contains("between 1 byte and 8 MiB")
         );
@@ -817,7 +886,10 @@ mod tests {
         let revision = archive.revision_sha256().unwrap();
         let expected: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_eq!(revision, expected);
-        assert_eq!(archive.source.stream_position().unwrap(), 7);
+        assert_eq!(
+            OpenedSource::stream_position(&mut archive.source).unwrap(),
+            7
+        );
         assert_eq!(archive.read("data.json").unwrap(), b"hello archive");
     }
 

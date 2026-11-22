@@ -1,16 +1,18 @@
+use rpg_archive_launcher::play::default_wal_path;
 use rpg_archive_launcher::vfs::Overlay;
 use rpg_archive_launcher::{
     archive::{Archive, Limits},
-    runtime,
+    play, runtime,
     save::Store,
 };
 use std::{
     env,
+    ffi::OsStr,
     io::{self, BufRead, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
-const HELP: &str = "RPG Archive Launcher 0.1 (experimental read-only mount probe)\n\nCommands:\n  probe-read ARCHIVE ENTRY [--password-stdin]\n  mount-ro ARCHIVE MOUNTPOINT BACKEND [--password-stdin] (feature fuse; BACKEND: kernel|fskit)\n  launch-directory MOUNTPOINT GAME_ROOT NWJS_EXECUTABLE PROFILE\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-bind ARCHIVE WAL [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, or NAS sync. Mounted saves are unsupported.\nlaunch-directory executes explicitly trusted game code without a sandbox.\n";
+const HELP: &str = "RPG Archive Launcher 0.1 (experimental)\n\nFriendly entry:\n  rpg-archive-launcher PATH.7z\n  rpg-archive-launcher PATH.7z.001\n  play|run ARCHIVE [--wal WAL] [--password-stdin]\n\nCommands:\n  probe-read ARCHIVE ENTRY [--password-stdin]\n  mount-ro ARCHIVE MOUNTPOINT BACKEND [--password-stdin] (feature fuse; BACKEND: kernel|fskit)\n  launch-directory MOUNTPOINT GAME_ROOT NWJS_EXECUTABLE PROFILE\n  inspect ARCHIVE [--password-stdin]\n  read ARCHIVE ENTRY [--password-stdin]\n  overlay-bind ARCHIVE WAL [--password-stdin]\n  overlay-read ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-read-at ARCHIVE WAL ENTRY OFFSET LENGTH [--password-stdin]\n  overlay-write-at ARCHIVE WAL ENTRY OFFSET INPUT_FILE [--password-stdin]\n  overlay-truncate ARCHIVE WAL ENTRY SIZE [--password-stdin]\n  overlay-unlink ARCHIVE WAL ENTRY [--password-stdin]\n  overlay-rename ARCHIVE WAL OLD NEW [--password-stdin]\n  save-put WAL ENTRY INPUT_FILE\n  save-get WAL ENTRY\n  save-delete WAL ENTRY\n  save-rename WAL OLD NEW\n\nplay prepares a local Upper WAL, applies RPG Maker overlay repairs, and reports\nruntime candidates. It does not mount a filesystem or launch NW.js.\nmount-ro is an optional read-only probe, not a writable mount.\nlaunch-directory runs an explicitly trusted NW.js binary; gameplay is not accepted.\n\nPasswords: one UTF-8 line on stdin, never command-line arguments.\nread / save-get emit bytes to stdout; redirect only if you want a plaintext file.\nWAL is persistent PLAINTEXT local storage; keep it in a private local directory.\nNo archive overwrite, full extraction, or NAS sync. Mounted saves are unsupported.\n";
 fn fail(s: impl Into<String>) -> Box<dyn std::error::Error> {
     io::Error::other(s.into()).into()
 }
@@ -48,17 +50,162 @@ fn read_password(encrypted: bool) -> Result<String, Box<dyn std::error::Error>> 
     Ok(password)
 }
 
+fn looks_like_archive_arg(arg: &str) -> bool {
+    let path = Path::new(arg);
+    if path.is_file() {
+        return true;
+    }
+    path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("7z")
+            || (ext.chars().all(|c| c.is_ascii_digit()) && ext.len() == 3)
+    })
+}
+
+fn parse_play_args(
+    args: &[String],
+) -> Result<(PathBuf, PathBuf, bool), Box<dyn std::error::Error>> {
+    if args.len() < 2 {
+        return Err(fail("play requires ARCHIVE; use --help"));
+    }
+    let archive = PathBuf::from(&args[1]);
+    let mut wal = default_wal_path(&archive);
+    let mut encrypted = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wal" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err(fail("--wal requires a path"));
+                };
+                wal = PathBuf::from(path);
+                index += 2;
+            }
+            "--password-stdin" => {
+                encrypted = true;
+                index += 1;
+            }
+            other => return Err(fail(format!("unknown play flag: {other}"))),
+        }
+    }
+    Ok((archive, wal, encrypted))
+}
+
+fn run_play(archive: &Path, wal: &Path, encrypted: bool) -> Result<(), Box<dyn std::error::Error>> {
+    rpg_archive_launcher::isolation::install_process_limits()?;
+    let mut password = String::new();
+    if encrypted {
+        let mut line = Vec::new();
+        io::stdin().lock().take(4097).read_until(b'\n', &mut line)?;
+        password = String::from_utf8(line)?;
+        if password.len() > 4096 {
+            return Err(fail("password input exceeds 4096 bytes"));
+        }
+        if password.ends_with('\n') {
+            password.pop();
+            if password.ends_with('\r') {
+                password.pop();
+            }
+        }
+        if password.contains('\n') {
+            return Err(fail("password input must be a single line"));
+        }
+    }
+    let summary = play::prepare(archive, wal, &password, Limits::default()).map_err(fail)?;
+    println!("archive: {}", summary.archive_display);
+    println!("upper: {}", summary.wal_path.display());
+    if let Some(engine) = &summary.engine {
+        println!("runtime: {engine}");
+    } else {
+        println!("runtime: no MV/MZ candidate detected");
+    }
+    if let Some(root) = &summary.game_root {
+        println!("game root: {root}");
+    }
+    let r = &summary.repairs;
+    if r.plugins_greenworks_disabled > 0 {
+        println!(
+            "repair: disabled OrangeGreenworks in {} plugins.js",
+            r.plugins_greenworks_disabled
+        );
+    }
+    if r.data_achievement_strips > 0 {
+        println!(
+            "repair: stripped activateAchievement in {} data JSON files",
+            r.data_achievement_strips
+        );
+    }
+    if r.mpp_color_index_moves > 0 {
+        println!(
+            "repair: fixed MPP_MessageEX _colorIndex order ({} edits)",
+            r.mpp_color_index_moves
+        );
+    }
+    if r.pixi_sourcemap_strips > 0 {
+        println!("repair: removed pixi.js sourcemap comment");
+    }
+    if r.package_name_set_www {
+        println!("repair: set package.json name to www");
+    }
+    println!("mount: not implemented in this prototype (macOS FSKit / Linux FUSE still required)");
+    println!(
+        "runtime launch: NW.js not bundled; overlay-read and future mount will expose contents"
+    );
+    let password_flag = if encrypted { " --password-stdin" } else { "" };
+    println!(
+        "next: overlay-read {:?} {:?} <entry>{password_flag}",
+        archive, summary.wal_path
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "__decoder-worker") {
         return rpg_archive_launcher::worker::serve().map_err(fail);
     }
-    let encrypted = args.iter().any(|s| s == "--password-stdin");
-    args.retain(|s| s != "--password-stdin");
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print!("{HELP}");
         return Ok(());
     }
+    const COMMANDS: &[&str] = &[
+        "inspect",
+        "read",
+        "play",
+        "run",
+        "probe-read",
+        "mount-ro",
+        "launch-directory",
+        "overlay-bind",
+        "overlay-read",
+        "overlay-read-at",
+        "overlay-write-at",
+        "overlay-truncate",
+        "overlay-unlink",
+        "overlay-rename",
+        "save-put",
+        "save-get",
+        "save-delete",
+        "save-rename",
+    ];
+    if !COMMANDS.contains(&args[0].as_str()) && looks_like_archive_arg(&args[0]) {
+        args.insert(0, "play".into());
+    }
+    if args[0] == "run" {
+        args[0] = "play".into();
+    }
+    if args[0] == "play" {
+        if args
+            .get(1)
+            .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
+        {
+            print!("{HELP}");
+            return Ok(());
+        }
+        let (archive, wal, encrypted) = parse_play_args(&args)?;
+        return run_play(&archive, &wal, encrypted);
+    }
+    let encrypted = args.iter().any(|s| s == "--password-stdin");
+    args.retain(|s| s != "--password-stdin");
     if args[0] == "launch-directory" {
         if encrypted || args.len() != 5 {
             return Err(fail(
@@ -157,6 +304,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "runtime candidate: {} root={:?} native_modules={:?}",
                         c.engine, c.root, c.native_modules
+                    );
+                }
+                let volumes = archive.volume_paths();
+                if volumes.len() > 1 {
+                    println!(
+                        "volumes: {}",
+                        volumes
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 println!("runtime report limits: 512 candidates, 64 native modules per candidate");
