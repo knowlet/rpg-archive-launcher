@@ -53,15 +53,24 @@ fn frame_write(output: &mut impl Write, data: &[u8], maximum: usize) -> io::Resu
     output.flush()
 }
 fn response(output: &mut impl Write, result: Result<Vec<u8>>) -> io::Result<()> {
-    let (status, mut data) = match result {
-        Ok(data) => (0, data),
-        Err(error) => (1, error.into_bytes()),
+    // A single oversized payload must become a normal error frame. Failing the
+    // write here ends the child and makes every later read on the mount EIO.
+    let (status, data) = match result {
+        Ok(data) if data.len() < MAX_RESPONSE => (0, data),
+        Ok(_) => (1, b"worker response exceeds limit".to_vec()),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            if bytes.len() < MAX_RESPONSE {
+                (1, bytes)
+            } else {
+                (1, b"worker error exceeds limit".to_vec())
+            }
+        }
     };
-    if data.len() >= MAX_RESPONSE {
-        return Err(io::Error::other("worker response exceeds limit"));
-    }
-    data.insert(0, status);
-    frame_write(output, &data, MAX_RESPONSE)
+    let mut framed = Vec::with_capacity(data.len() + 1);
+    framed.push(status);
+    framed.extend_from_slice(&data);
+    frame_write(output, &framed, MAX_RESPONSE)
 }
 
 /// Internal child entry point. Call only from the executable's decoder command.
@@ -249,28 +258,35 @@ impl DecoderWorker {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+    /// Logical read failures stay on that call. Transport, timeout, supervision,
+    /// and malformed frames retire the child; an oversized entry must not.
     fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>> {
         if self.failed {
             return Err("decoder worker is unavailable".into());
         }
-        let result = self.exchange_inner(request);
-        if result.is_err() {
-            self.stop();
+        match self.exchange_inner(request) {
+            Ok(data) => Ok(data),
+            Err(error) if error.fatal => {
+                self.stop();
+                Err(error.message)
+            }
+            Err(error) => Err(error.message),
         }
-        result
     }
-    fn check_watchdog(&self, start: Instant) -> Result<()> {
+    fn check_watchdog(&self, start: Instant) -> std::result::Result<(), ExchangeError> {
         if start.elapsed() >= TIMEOUT {
-            return Err("decoder worker wall timeout".into());
+            return Err(ExchangeError::fatal("decoder worker wall timeout"));
         }
         if self.watch_failed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("decoder worker RSS supervision failed or exceeded limit".into());
+            return Err(ExchangeError::fatal(
+                "decoder worker RSS supervision failed or exceeded limit",
+            ));
         }
         Ok(())
     }
-    fn exchange_inner(&mut self, request: &[u8]) -> Result<Vec<u8>> {
+    fn exchange_inner(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, ExchangeError> {
         if request.len() > MAX_REQUEST {
-            return Err("worker request exceeds limit".into());
+            return Err(ExchangeError::rejected("worker request exceeds limit"));
         }
         let start = Instant::now();
         let mut frame = Vec::with_capacity(request.len() + 4);
@@ -282,34 +298,55 @@ impl DecoderWorker {
             match self
                 .input
                 .as_mut()
-                .ok_or("worker closed")?
+                .ok_or_else(|| ExchangeError::fatal("worker closed"))?
                 .write(&frame[sent..])
             {
-                Ok(0) => return Err("worker pipe closed".into()),
+                Ok(0) => return Err(ExchangeError::fatal("worker pipe closed")),
                 Ok(n) => sent += n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(ExchangeError::fatal(e.to_string())),
             }
         }
         loop {
             self.check_watchdog(start)?;
             match self.replies.recv_timeout(POLL) {
                 Ok(reply) => {
-                    let mut data = reply.map_err(|e| e.to_string())?;
+                    let mut data = reply.map_err(|e| ExchangeError::fatal(e.to_string()))?;
                     if data.is_empty() {
-                        return Err("empty worker response".into());
+                        return Err(ExchangeError::fatal("empty worker response"));
                     }
                     let status = data.remove(0);
                     return match status {
                         0 => Ok(data),
-                        1 => Err(String::from_utf8_lossy(&data).into_owned()),
-                        _ => Err("invalid worker response status".into()),
+                        1 => Err(ExchangeError::rejected(
+                            String::from_utf8_lossy(&data).into_owned(),
+                        )),
+                        _ => Err(ExchangeError::fatal("invalid worker response status")),
                     };
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => return Err("decoder worker EOF".into()),
+                Err(_) => return Err(ExchangeError::fatal("decoder worker EOF")),
             }
+        }
+    }
+}
+
+struct ExchangeError {
+    fatal: bool,
+    message: String,
+}
+impl ExchangeError {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            fatal: true,
+            message: message.into(),
+        }
+    }
+    fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            fatal: false,
+            message: message.into(),
         }
     }
 }
@@ -391,5 +428,20 @@ mod tests {
     #[test]
     fn truncated_frame_fails() {
         assert!(frame_read(&mut &[3, 0, 0, 0, 1][..], 4).is_err());
+    }
+    #[test]
+    fn oversized_payload_is_an_error_frame_and_the_stream_continues() {
+        let mut output = Vec::new();
+        response(&mut output, Ok(vec![9; MAX_RESPONSE])).unwrap();
+        response(&mut output, Ok(b"next".to_vec())).unwrap();
+        let mut cursor = std::io::Cursor::new(output);
+        let first = frame_read(&mut cursor, MAX_RESPONSE).unwrap();
+        assert_eq!(first[0], 1);
+        assert!(
+            std::str::from_utf8(&first[1..])
+                .unwrap()
+                .contains("exceeds limit")
+        );
+        assert_eq!(frame_read(&mut cursor, MAX_RESPONSE).unwrap(), b"\0next");
     }
 }

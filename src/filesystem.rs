@@ -3,10 +3,18 @@
 //! This is not a complete POSIX inode/handle or writable mount implementation.
 use crate::{
     archive::{ArchiveSource, validate_archive_path},
-    save::{Entry, MAX_BYTES, Store},
+    save::{Entry, MAX_BYTES, Occupancy, Store},
 };
 use std::collections::{BTreeMap, BTreeSet};
 type Result<T> = std::result::Result<T, String>;
+
+fn has_descendant(names: &BTreeMap<String, Option<u64>>, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    names
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|(name, _)| name.starts_with(&prefix))
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metadata {
     pub size: u64,
@@ -79,8 +87,10 @@ impl<S: ArchiveSource> Filesystem<S> {
             .bind_archive(self.revision)
             .map_err(|e| e.to_string())?;
         self.upper = Some((store, save_prefix.into()));
-        // Validate persisted upper against the complete visible lower namespace.
-        let names: Vec<String> = self
+        // One namespace walk. Per-key `destination` rebuilt it, and each rebuild
+        // cloned every live payload, so reopen copied bytes roughly n times.
+        let visible = self.visible()?;
+        let live: Vec<String> = self
             .upper
             .as_ref()
             .unwrap()
@@ -89,8 +99,8 @@ impl<S: ArchiveSource> Filesystem<S> {
             .map_err(|e| e.to_string())?
             .map(str::to_owned)
             .collect();
-        for name in names {
-            self.destination(&name)?;
+        for name in &live {
+            Self::reject_directory_collision(&self.lower, &visible, name)?;
         }
         Ok(self)
     }
@@ -114,20 +124,22 @@ impl<S: ArchiveSource> Filesystem<S> {
             // Lower tombstones may hide files, but explicit directories survive.
             for (path, size) in &self.lower {
                 if size.is_some() && path.starts_with(&format!("{prefix}/")) {
-                    match upper.lookup(path).map_err(|e| e.to_string())? {
-                        Some(Entry::Deleted) => {
+                    match upper.occupancy(path).map_err(|e| e.to_string())? {
+                        Some(Occupancy::Deleted) => {
                             result.remove(path);
                         }
-                        Some(Entry::Data(data)) => {
-                            result.insert(path.clone(), Some(data.len() as u64));
+                        Some(Occupancy::Data(len)) => {
+                            result.insert(path.clone(), Some(len));
                         }
                         None => {}
                     }
                 }
             }
             for path in upper.live_names().map_err(|e| e.to_string())? {
-                if let Some(data) = upper.get(path).map_err(|e| e.to_string())? {
-                    result.insert(path.into(), Some(data.len() as u64));
+                if let Some(Occupancy::Data(len)) =
+                    upper.occupancy(path).map_err(|e| e.to_string())?
+                {
+                    result.insert(path.to_owned(), Some(len));
                 }
             }
             result.entry(prefix.clone()).or_insert(None);
@@ -216,10 +228,16 @@ impl<S: ArchiveSource> Filesystem<S> {
         Ok(())
     }
     fn destination(&self, path: &str) -> Result<()> {
-        let names = self.visible()?;
-        if matches!(self.lower.get(path), Some(None))
+        Self::reject_directory_collision(&self.lower, &self.visible()?, path)
+    }
+    fn reject_directory_collision(
+        lower: &BTreeMap<String, Option<u64>>,
+        names: &BTreeMap<String, Option<u64>>,
+        path: &str,
+    ) -> Result<()> {
+        if matches!(lower.get(path), Some(None))
             || matches!(names.get(path), Some(None))
-            || names.keys().any(|p| p.starts_with(&format!("{path}/")))
+            || has_descendant(names, path)
         {
             return Err("destination is a directory".into());
         }
@@ -418,5 +436,41 @@ mod tests {
             lower.read_at("遊戲/save/file1.rmmzsave", 0, 100).unwrap(),
             b"lower"
         );
+    }
+    #[test]
+    fn reopening_populated_store_copies_each_payload_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("upper.wal");
+        let count = 48usize;
+        let size = 4096usize;
+        let payload = vec![7u8; size];
+        {
+            let mut store = Store::open(&wal).unwrap();
+            store.bind_archive([42; 32]).unwrap();
+            store.delete("game/save/old").unwrap();
+            for i in 0..count {
+                store
+                    .put(&format!("game/save/slot-{i:04}"), &payload)
+                    .unwrap();
+            }
+        }
+        let wal_payload_bytes = count * size;
+        let mut lower = BTreeMap::new();
+        lower.insert("game/save/old".into(), b"old-lower".to_vec());
+        lower.insert("game/save/slot-0000".into(), b"lower".to_vec());
+        lower.insert("game/readme.txt".into(), b"readme".to_vec());
+        let mut fs = Filesystem::readonly(Synthetic(lower))
+            .unwrap()
+            .with_upper(Store::open(&wal).unwrap(), "game/save")
+            .unwrap();
+        let copied = fs.upper.as_ref().unwrap().0.payload_bytes_copied();
+        assert_eq!(
+            copied, wal_payload_bytes,
+            "reopen copied {copied} payload bytes for {wal_payload_bytes} WAL payload bytes"
+        );
+        assert_eq!(fs.read_at("game/save/slot-0001", 0, size).unwrap(), payload);
+        assert_eq!(fs.read_at("game/save/slot-0000", 0, size).unwrap(), payload);
+        assert!(fs.read_at("game/save/old", 0, 100).is_err());
+        assert_eq!(fs.read_at("game/readme.txt", 0, 100).unwrap(), b"readme");
     }
 }

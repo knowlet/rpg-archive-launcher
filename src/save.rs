@@ -32,6 +32,14 @@ pub enum Entry {
     Deleted,
 }
 
+/// Payload-free view of one key. Namespace checks use this so reopen does not
+/// clone every live file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Occupancy {
+    Data(u64),
+    Deleted,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Binding {
     game_id: [u8; 16],
@@ -48,6 +56,9 @@ pub struct Store {
     poisoned: bool,
     binding: Option<Binding>,
     has_records: bool,
+    /// Bytes copied into owned save payloads. Reopen must stay linear in this.
+    #[cfg(test)]
+    copied_payload_bytes: std::sync::atomic::AtomicUsize,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -174,6 +185,8 @@ impl Store {
                 poisoned: false,
                 binding: None,
                 has_records: false,
+                #[cfg(test)]
+                copied_payload_bytes: std::sync::atomic::AtomicUsize::new(0),
             };
             store.recover()?;
             Ok(store)
@@ -218,7 +231,31 @@ impl Store {
                 }),
             ));
         }
-        Ok((decode(payload, &self.entries)?, None))
+        let changes = decode(payload, &self.entries)?;
+        self.note_copied_payload(&changes);
+        Ok((changes, None))
+    }
+
+    #[cfg(test)]
+    fn note_copied_payload(&self, changes: &[(String, Entry)]) {
+        let bytes = changes.iter().fold(0, |total, (_, entry)| {
+            total
+                + match entry {
+                    Entry::Data(data) => data.len(),
+                    Entry::Deleted => 0,
+                }
+        });
+        self.copied_payload_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    fn note_copied_payload(&self, _: &[(String, Entry)]) {}
+
+    #[cfg(test)]
+    pub(crate) fn payload_bytes_copied(&self) -> usize {
+        self.copied_payload_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn ensure_healthy(&self) -> io::Result<()> {
@@ -256,7 +293,24 @@ impl Store {
     pub fn lookup(&self, key: &str) -> io::Result<Option<Entry>> {
         self.ensure_healthy()?;
         validate_key(key)?;
-        Ok(self.entries.get(key).cloned())
+        let found = self.entries.get(key).cloned();
+        #[cfg(test)]
+        if let Some(Entry::Data(bytes)) = &found {
+            self.copied_payload_bytes
+                .fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(found)
+    }
+
+    /// File length or tombstone without cloning the payload.
+    pub(crate) fn occupancy(&self, key: &str) -> io::Result<Option<Occupancy>> {
+        self.ensure_healthy()?;
+        validate_key(key)?;
+        Ok(match self.entries.get(key) {
+            Some(Entry::Data(bytes)) => Some(Occupancy::Data(bytes.len() as u64)),
+            Some(Entry::Deleted) => Some(Occupancy::Deleted),
+            None => None,
+        })
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {

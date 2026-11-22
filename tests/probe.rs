@@ -110,17 +110,27 @@ fn worker_rejects_oversize_entry_before_payload_response() {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("large.7z");
     let mut writer = ArchiveWriter::create(&archive).unwrap();
+    writer
+        .push_archive_entry(
+            ArchiveEntry::new_file("small.txt"),
+            Some(b"still-readable".as_slice()),
+        )
+        .unwrap();
     let data = vec![b'x'; 17 * 1024 * 1024];
     writer
         .push_archive_entry(ArchiveEntry::new_file("large.bin"), Some(data.as_slice()))
         .unwrap();
     writer.finish().unwrap();
     drop(data);
-    let mut source = worker(&archive, "").unwrap();
+    let mut fs = Filesystem::readonly(worker(&archive, "").unwrap()).unwrap();
+    let error = fs.read_at("large.bin", 0, 16).unwrap_err();
+    assert!(error.contains("over request limit"), "{error}");
+    assert!(!error.contains("unavailable"), "{error}");
+    assert_eq!(fs.read_at("small.txt", 0, 100).unwrap(), b"still-readable");
     assert!(
-        source
-            .read("large.bin")
+        fs.read_at("large.bin", 100, 16)
             .unwrap_err()
             .contains("over request limit")
     );
+    assert_eq!(fs.read_at("small.txt", 6, 8).unwrap(), b"readable");
 }
