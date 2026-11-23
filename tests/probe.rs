@@ -151,6 +151,12 @@ fn worker_exit_with_descendant_holding_stdout_does_not_hang() {
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    // Orphans of the exited shell are reparented here, which is what leaves
+    // a killed descendant as a zombie if stop() only waits for the leader.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    }
     let start = Instant::now();
     let result = DecoderWorker::spawn(&fake, Path::new("ignored"), "");
     let elapsed = start.elapsed();
@@ -168,6 +174,32 @@ fn worker_exit_with_descendant_holding_stdout_does_not_hang() {
         0,
         "descendant {pid} survived"
     );
+    #[cfg(target_os = "linux")]
+    {
+        let me = std::process::id().to_string();
+        let mut zombies = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(child) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(format!("/proc/{child}/stat")) else {
+                continue;
+            };
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next().unwrap_or("");
+            let ppid = fields.next().unwrap_or("");
+            if state == "Z" && ppid == me {
+                zombies.push(child);
+            }
+        }
+        assert!(
+            zombies.is_empty(),
+            "zombie children left behind: {zombies:?}"
+        );
+    }
 }
 
 #[test]

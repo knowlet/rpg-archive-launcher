@@ -5,15 +5,39 @@ use crate::{
     archive::{ArchiveSource, validate_archive_path},
     save::{Entry, MAX_BYTES, Occupancy, Store},
 };
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 type Result<T> = std::result::Result<T, String>;
 
-fn has_descendant(names: &BTreeMap<String, Option<u64>>, path: &str) -> bool {
-    let prefix = format!("{path}/");
-    names
-        .range(prefix.clone()..)
-        .next()
-        .is_some_and(|(name, _)| name.starts_with(&prefix))
+/// Lower names. `Clone` counts a full copy so lookups can be checked for one.
+struct Names {
+    map: BTreeMap<String, Option<u64>>,
+    #[cfg(test)]
+    clones: Cell<usize>,
+}
+impl Names {
+    fn new(map: BTreeMap<String, Option<u64>>) -> Self {
+        Self {
+            map,
+            #[cfg(test)]
+            clones: Cell::new(0),
+        }
+    }
+    fn get(&self, key: &str) -> Option<&Option<u64>> {
+        self.map.get(key)
+    }
+}
+impl Clone for Names {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        self.clones.set(self.clones.get() + 1);
+        Self {
+            map: self.map.clone(),
+            #[cfg(test)]
+            clones: Cell::new(0),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metadata {
@@ -22,7 +46,7 @@ pub struct Metadata {
 }
 pub struct Filesystem<S: ArchiveSource> {
     source: S,
-    lower: BTreeMap<String, Option<u64>>,
+    lower: Names,
     upper: Option<(Store, String)>,
     revision: [u8; 32],
 }
@@ -51,7 +75,7 @@ impl<S: ArchiveSource> Filesystem<S> {
         let revision = source.revision_sha256()?;
         Ok(Self {
             source,
-            lower,
+            lower: Names::new(lower),
             upper: None,
             revision,
         })
@@ -87,9 +111,6 @@ impl<S: ArchiveSource> Filesystem<S> {
             .bind_archive(self.revision)
             .map_err(|e| e.to_string())?;
         self.upper = Some((store, save_prefix.into()));
-        // One namespace walk. Per-key `destination` rebuilt it, and each rebuild
-        // cloned every live payload, so reopen copied bytes roughly n times.
-        let visible = self.visible()?;
         let live: Vec<String> = self
             .upper
             .as_ref()
@@ -100,7 +121,7 @@ impl<S: ArchiveSource> Filesystem<S> {
             .map(str::to_owned)
             .collect();
         for name in &live {
-            Self::reject_directory_collision(&self.lower, &visible, name)?;
+            self.destination(name)?;
         }
         Ok(self)
     }
@@ -118,33 +139,60 @@ impl<S: ArchiveSource> Filesystem<S> {
         }
         Ok(())
     }
-    fn visible(&self) -> Result<BTreeMap<String, Option<u64>>> {
-        let mut result = self.lower.clone();
-        if let Some((upper, prefix)) = &self.upper {
-            // Lower tombstones may hide files, but explicit directories survive.
-            for (path, size) in &self.lower {
-                if size.is_some() && path.starts_with(&format!("{prefix}/")) {
-                    match upper.occupancy(path).map_err(|e| e.to_string())? {
-                        Some(Occupancy::Deleted) => {
-                            result.remove(path);
-                        }
-                        Some(Occupancy::Data(len)) => {
-                            result.insert(path.clone(), Some(len));
-                        }
-                        None => {}
-                    }
-                }
-            }
-            for path in upper.live_names().map_err(|e| e.to_string())? {
-                if let Some(Occupancy::Data(len)) =
-                    upper.occupancy(path).map_err(|e| e.to_string())?
-                {
-                    result.insert(path.to_owned(), Some(len));
-                }
-            }
-            result.entry(prefix.clone()).or_insert(None);
+    fn under_save(&self, key: &str) -> Option<(&Store, &str)> {
+        let (upper, prefix) = self.upper.as_ref()?;
+        if key == prefix || key.starts_with(&format!("{prefix}/")) {
+            Some((upper, prefix))
+        } else {
+            None
         }
-        Ok(result)
+    }
+    fn file_len(&self, key: &str) -> Result<Option<u64>> {
+        if let Some((upper, _)) = self.under_save(key) {
+            match upper.occupancy(key).map_err(|e| e.to_string())? {
+                Some(Occupancy::Data(len)) => return Ok(Some(len)),
+                Some(Occupancy::Deleted) => return Ok(None),
+                None => {}
+            }
+        }
+        Ok(match self.lower.get(key) {
+            Some(Some(len)) => Some(*len),
+            _ => None,
+        })
+    }
+    fn explicit_dir(&self, key: &str) -> bool {
+        matches!(self.lower.get(key), Some(None))
+            || self.upper.as_ref().is_some_and(|(_, prefix)| prefix == key)
+    }
+    fn has_visible_descendant(&self, key: &str) -> Result<bool> {
+        let prefix = format!("{key}/");
+        let (upper, save_prefix) = self
+            .upper
+            .as_ref()
+            .map(|(store, prefix)| (Some(store), prefix.as_str()))
+            .unwrap_or((None, ""));
+        for (path, size) in self.lower.map.range(prefix.clone()..) {
+            if !path.starts_with(&prefix) {
+                break;
+            }
+            if size.is_none() {
+                return Ok(true);
+            }
+            let tombstoned = upper.is_some_and(|_| path.starts_with(&format!("{save_prefix}/")))
+                && matches!(
+                    upper.unwrap().occupancy(path).map_err(|e| e.to_string())?,
+                    Some(Occupancy::Deleted)
+                );
+            if !tombstoned {
+                return Ok(true);
+            }
+        }
+        if let Some(store) = upper
+            && store.has_live_descendant(key).map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
+        Ok(false)
     }
     pub fn metadata(&mut self, path: &str) -> Result<Metadata> {
         let key = Self::key(path)?;
@@ -155,21 +203,28 @@ impl<S: ArchiveSource> Filesystem<S> {
                 directory: true,
             });
         }
-        let names = self.visible()?;
-        if let Some(size) = names.get(key) {
+        if let Some(size) = self.file_len(key)? {
             return Ok(Metadata {
-                size: size.unwrap_or(0),
-                directory: size.is_none(),
+                size,
+                directory: false,
             });
         }
-        let prefix = format!("{key}/");
-        if names.keys().any(|p| p.starts_with(&prefix)) {
+        if self.explicit_dir(key) || self.has_visible_descendant(key)? {
             return Ok(Metadata {
                 size: 0,
                 directory: true,
             });
         }
         Err("file not found".into())
+    }
+    fn child_name<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+        let suffix = if prefix.is_empty() {
+            path
+        } else {
+            path.strip_prefix(prefix)?
+        };
+        let name = suffix.split('/').next().unwrap_or("");
+        (!name.is_empty()).then_some(name)
     }
     pub fn readdir(&mut self, path: &str) -> Result<Vec<String>> {
         if !self.metadata(path)?.directory {
@@ -182,12 +237,46 @@ impl<S: ArchiveSource> Filesystem<S> {
             format!("{key}/")
         };
         let mut children = BTreeSet::new();
-        for path in self.visible()?.keys() {
-            if let Some(suffix) = path.strip_prefix(&prefix)
-                && let Some(name) = suffix.split('/').next()
-                && !name.is_empty()
+        let upper = self.upper.as_ref();
+        let save_prefix = upper.map(|(_, prefix)| prefix.as_str()).unwrap_or("");
+        let start = if prefix.is_empty() {
+            String::new()
+        } else {
+            prefix.clone()
+        };
+        for (path, size) in self.lower.map.range(start..) {
+            if !prefix.is_empty() && !path.starts_with(&prefix) {
+                break;
+            }
+            let tombstoned = size.is_some()
+                && upper.is_some()
+                && path.starts_with(&format!("{save_prefix}/"))
+                && matches!(
+                    upper
+                        .unwrap()
+                        .0
+                        .occupancy(path)
+                        .map_err(|e| e.to_string())?,
+                    Some(Occupancy::Deleted)
+                );
+            if tombstoned {
+                continue;
+            }
+            if let Some(name) = Self::child_name(path, &prefix) {
+                children.insert(name.to_owned());
+            }
+        }
+        if let Some((store, save_prefix)) = upper {
+            for name in store.live_names().map_err(|e| e.to_string())? {
+                if let Some(child) = Self::child_name(name, &prefix) {
+                    children.insert(child.to_owned());
+                }
+            }
+            if key != save_prefix
+                && (prefix.is_empty() || save_prefix.starts_with(&prefix))
+                && let Some(child) = Self::child_name(save_prefix, &prefix)
             {
-                children.insert(name.into());
+                children.insert(child.to_owned());
             }
         }
         Ok(children.into_iter().collect())
@@ -224,21 +313,11 @@ impl<S: ArchiveSource> Filesystem<S> {
         Ok(())
     }
     fn destination(&self, path: &str) -> Result<()> {
-        Self::reject_directory_collision(&self.lower, &self.visible()?, path)
-    }
-    fn reject_directory_collision(
-        lower: &BTreeMap<String, Option<u64>>,
-        names: &BTreeMap<String, Option<u64>>,
-        path: &str,
-    ) -> Result<()> {
-        if matches!(lower.get(path), Some(None))
-            || matches!(names.get(path), Some(None))
-            || has_descendant(names, path)
-        {
+        if self.explicit_dir(path) || self.has_visible_descendant(path)? {
             return Err("destination is a directory".into());
         }
         for (i, _) in path.match_indices('/') {
-            if matches!(names.get(&path[..i]), Some(Some(_))) {
+            if self.file_len(&path[..i])?.is_some() {
                 return Err("destination ancestor is a file".into());
             }
         }
@@ -522,5 +601,35 @@ mod tests {
         assert_eq!(fs.read_at("game/save/slot-0000", 0, size).unwrap(), payload);
         assert!(fs.read_at("game/save/old", 0, 100).is_err());
         assert_eq!(fs.read_at("game/readme.txt", 0, 100).unwrap(), b"readme");
+    }
+    #[test]
+    fn lookups_do_not_clone_the_namespace() {
+        let mut lower = BTreeMap::new();
+        for i in 0..64 {
+            lower.insert(format!("game/save/slot-{i:04}"), b"x".to_vec());
+            lower.insert(format!("game/data/map-{i:04}"), b"y".to_vec());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("upper.wal");
+        {
+            let mut store = Store::open(&wal).unwrap();
+            store.bind_archive([42; 32]).unwrap();
+            store.put("game/save/slot-0000", b"replaced").unwrap();
+            store.delete("game/save/slot-0001").unwrap();
+        }
+        let mut fs = Filesystem::readonly(Synthetic(lower))
+            .unwrap()
+            .with_upper(Store::open(&wal).unwrap(), "game/save")
+            .unwrap();
+        assert_eq!(fs.lower.clones.get(), 0);
+        for _ in 0..32 {
+            assert!(fs.metadata("game/save/slot-0000").unwrap().size > 0);
+            assert!(fs.metadata("game/data/map-0003").is_ok());
+            assert!(fs.metadata("game/save").unwrap().directory);
+            assert!(fs.metadata("game/missing").is_err());
+            assert!(fs.readdir("game").unwrap().contains(&"save".to_string()));
+            assert!(fs.readdir("/").unwrap().contains(&"game".to_string()));
+        }
+        assert_eq!(fs.lower.clones.get(), 0, "lookup cloned the namespace");
     }
 }

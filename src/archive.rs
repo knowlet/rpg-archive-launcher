@@ -150,6 +150,15 @@ pub(crate) fn slice_range(mut data: Vec<u8>, offset: u64, length: usize) -> Vec<
     data
 }
 
+fn copy_span(bytes: &[u8], offset: u64, length: usize) -> Vec<u8> {
+    if length == 0 || offset >= bytes.len() as u64 {
+        return Vec::new();
+    }
+    let start = offset as usize;
+    let end = start + length.min(bytes.len() - start);
+    bytes[start..end].to_vec()
+}
+
 /// Strict portable relative path policy. No URL decoding is performed here.
 pub fn validate_archive_path(name: &str) -> Result<()> {
     if name.is_empty()
@@ -589,6 +598,33 @@ impl Archive {
             self.ensure_source_unchanged()?;
             return Ok(result);
         }
+        let output = self.decode_entry(name)?;
+        if (output.len() as u64) <= self.limits.max_cache_bytes {
+            self.cache = Some((name.to_owned(), output.clone()));
+        }
+        Ok(output)
+    }
+
+    /// Bytes in `[offset, offset+length)`. A cache hit copies only that span.
+    pub fn read_range(&mut self, name: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        validate_archive_path(name)?;
+        self.ensure_source_unchanged()?;
+        if let Some((key, bytes)) = &self.cache
+            && key == name
+        {
+            let slice = copy_span(bytes, offset, length);
+            self.ensure_source_unchanged()?;
+            return Ok(slice);
+        }
+        let output = self.decode_entry(name)?;
+        let slice = copy_span(&output, offset, length);
+        if (output.len() as u64) <= self.limits.max_cache_bytes {
+            self.cache = Some((name.to_owned(), output));
+        }
+        Ok(slice)
+    }
+
+    fn decode_entry(&mut self, name: &str) -> Result<Vec<u8>> {
         let i = *self
             .index
             .get(name)
@@ -643,9 +679,6 @@ impl Archive {
             .map_err(|e| format!("archive decode: {e}"))?;
         let output = output.ok_or("entry missing from block")?;
         self.ensure_source_unchanged()?;
-        if size <= self.limits.max_cache_bytes {
-            self.cache = Some((name.to_owned(), output.clone()));
-        }
         Ok(output)
     }
 }
@@ -656,6 +689,9 @@ impl ArchiveSource for Archive {
     }
     fn read(&mut self, path: &str) -> Result<Vec<u8>> {
         Archive::read(self, path)
+    }
+    fn read_range(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        Archive::read_range(self, path, offset, length)
     }
     fn revision_sha256(&mut self) -> Result<[u8; 32]> {
         Archive::revision_sha256(self)
@@ -955,6 +991,34 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("regular file")
+        );
+    }
+
+    #[test]
+    fn range_read_does_not_retain_a_full_entry_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("range.7z");
+        let mut writer = ArchiveWriter::create(&path).unwrap();
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("big.bin"), Some(payload.as_slice()))
+            .unwrap();
+        writer.finish().unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
+        for _ in 0..3 {
+            let part = archive.read_range("big.bin", 100, 16).unwrap();
+            assert_eq!(part, payload[100..116]);
+            assert!(
+                part.capacity() < 4096,
+                "range read kept a full-entry buffer (capacity {})",
+                part.capacity()
+            );
+        }
+        assert_eq!(
+            archive
+                .read_range("big.bin", payload.len() as u64, 8)
+                .unwrap(),
+            Vec::<u8>::new()
         );
     }
 }

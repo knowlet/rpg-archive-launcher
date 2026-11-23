@@ -148,9 +148,9 @@ pub fn serve() -> Result<()> {
                         serde_json::Value::Number(offset),
                         serde_json::Value::Number(length),
                     ] => match (offset.as_u64(), length.as_u64()) {
-                        (Some(offset), Some(length)) if length < MAX_RESPONSE as u64 => archive
-                            .read(p)
-                            .map(|data| crate::archive::slice_range(data, offset, length as usize)),
+                        (Some(offset), Some(length)) if length < MAX_RESPONSE as u64 => {
+                            archive.read_range(p, offset, length as usize)
+                        }
                         _ => Err("invalid range request".into()),
                     },
                     _ => return Err("malformed worker request".into()),
@@ -287,10 +287,33 @@ impl DecoderWorker {
             // cannot have been reused.
             #[cfg(unix)]
             unsafe {
-                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+                let pid = self.child.id() as i32;
+                libc::kill(-pid, libc::SIGKILL);
+                // SIGKILL and reparent-to-subreaper are not instantaneous.
+                // Keep collecting group zombies, or the descendant stays defunct.
+                let deadline = Instant::now() + Duration::from_millis(200);
+                loop {
+                    let mut reaped_any = false;
+                    loop {
+                        if libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {
+                            reaped_any = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    if !reaped_any {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            #[cfg(not(unix))]
+            {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
             self.reaped = true;
         }
     }

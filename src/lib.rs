@@ -1,6 +1,7 @@
 pub mod archive;
 #[cfg(unix)]
 pub mod filesystem;
+pub mod fixture;
 pub mod isolation;
 pub mod launcher;
 #[cfg(feature = "fuse")]
