@@ -16,6 +16,11 @@ const MAX_METADATA: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 16384;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(20);
+/// After the child exits, how long its final reply may take to arrive. Only a
+/// descendant still holding stdout keeps the pipe open past the exit.
+const EXIT_GRACE: Duration = Duration::from_secs(1);
+/// How long Drop waits for the reader thread before detaching it.
+const READER_JOIN: Duration = Duration::from_secs(2);
 type Result<T> = std::result::Result<T, String>;
 
 pub(crate) struct WorkerPermit {
@@ -149,6 +154,7 @@ pub struct DecoderWorker {
     entries: Vec<(String, Option<u64>)>,
     revision: [u8; 32],
     failed: bool,
+    reaped: bool,
     watchdog: Option<thread::JoinHandle<()>>,
     watch_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watch_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -166,13 +172,17 @@ impl DecoderWorker {
         if init.len() > MAX_REQUEST {
             return Err("worker initialization exceeds limit".into());
         }
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("__decoder-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .stderr(Stdio::null());
+        // Its own process group, so stop() also kills any descendant that
+        // inherited the pipes; otherwise one could keep stdout open forever.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
         let input = child.stdin.take();
         #[cfg(unix)]
         {
@@ -227,6 +237,7 @@ impl DecoderWorker {
             entries: Vec::new(),
             revision: [0; 32],
             failed: false,
+            reaped: false,
             watchdog: Some(watchdog),
             watch_stop,
             watch_failed,
@@ -255,8 +266,38 @@ impl DecoderWorker {
         if let Some(watchdog) = self.watchdog.take() {
             let _ = watchdog.join();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            // The group leader is not reaped yet, so its PID (the group ID)
+            // cannot have been reused.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+    /// Whether the child has exited, without reaping it (the watchdog may
+    /// still signal its PID).
+    fn child_exited(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let status = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            status == 0 && unsafe { info.si_pid() } != 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
     /// Logical read failures stay on that call. Transport, timeout, supervision,
     /// and malformed frames retire the child; an oversized entry must not.
@@ -308,6 +349,7 @@ impl DecoderWorker {
                 Err(e) => return Err(ExchangeError::fatal(e.to_string())),
             }
         }
+        let mut exited_at: Option<Instant> = None;
         loop {
             self.check_watchdog(start)?;
             match self.replies.recv_timeout(POLL) {
@@ -325,7 +367,15 @@ impl DecoderWorker {
                         _ => Err(ExchangeError::fatal("invalid worker response status")),
                     };
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(at) = exited_at {
+                        if at.elapsed() >= EXIT_GRACE {
+                            return Err(ExchangeError::fatal("decoder worker exited"));
+                        }
+                    } else if self.child_exited() {
+                        exited_at = Some(Instant::now());
+                    }
+                }
                 Err(_) => return Err(ExchangeError::fatal("decoder worker EOF")),
             }
         }
@@ -372,7 +422,16 @@ impl Drop for DecoderWorker {
         let old = std::mem::replace(&mut self.replies, empty);
         drop(old);
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            // The group kill normally closes stdout at once. A descendant that
+            // left the group could still hold it; then detach rather than let
+            // Drop (and an unmount) hang on the blocked read.
+            let deadline = Instant::now() + READER_JOIN;
+            while !reader.is_finished() && Instant::now() < deadline {
+                thread::sleep(POLL);
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
         }
     }
 }

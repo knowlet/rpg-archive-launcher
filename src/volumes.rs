@@ -141,10 +141,35 @@ fn parse_volume_suffix(file_name: &str) -> (&str, Option<u32>) {
     (file_name, None)
 }
 
-#[derive(Debug)]
+/// Length and mtime alone miss a same-size in-place rewrite that restores the
+/// mtime (a timestamp-preserving sync). Like the single-archive source stamp,
+/// also bind device, inode, link count and change time, which a rewrite moves.
+#[derive(Debug, PartialEq, Eq)]
 struct VolumeSnapshot {
     len: u64,
     modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, u64, i64, i64),
+}
+
+impl VolumeSnapshot {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    meta.dev(),
+                    meta.ino(),
+                    meta.nlink(),
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                )
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -207,10 +232,7 @@ impl VolumeChain {
                 .checked_add(len)
                 .ok_or_else(|| "volume set size overflow".to_string())?;
             lengths.push(len);
-            snapshots.push(VolumeSnapshot {
-                len,
-                modified: meta.modified().ok(),
-            });
+            snapshots.push(VolumeSnapshot::of(&meta));
             files.push(file);
         }
         Ok(Self {
@@ -233,7 +255,7 @@ impl VolumeChain {
     pub fn volume_metadata_unchanged(&self) -> io::Result<()> {
         for (file, snap) in self.files.iter().zip(&self.snapshots) {
             let meta = file.metadata()?;
-            if !meta.is_file() || meta.len() != snap.len || meta.modified().ok() != snap.modified {
+            if !meta.is_file() || VolumeSnapshot::of(&meta) != *snap {
                 return Err(io::Error::other("split volume set changed on disk"));
             }
         }
@@ -428,6 +450,34 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn same_size_rewrite_with_restored_mtime_is_detected() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (1..=2)
+            .map(|index| {
+                let path = temp.path().join(format!("game.7z.{index:03}"));
+                std::fs::write(&path, format!("part-{index}")).unwrap();
+                path
+            })
+            .collect();
+        let chain = VolumeChain::open(&paths).unwrap();
+        chain.volume_metadata_unchanged().unwrap();
+        let before = std::fs::metadata(&paths[1]).unwrap().modified().unwrap();
+        // Coarse-ctime filesystems need the change to land in a later tick.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap();
+        std::io::Write::write_all(&mut &file, b"PART-2").unwrap();
+        file.set_modified(before).unwrap();
+        drop(file);
+        let after = std::fs::metadata(&paths[1]).unwrap();
+        assert_eq!(after.len(), 6);
+        assert_eq!(after.modified().unwrap(), before);
+        assert!(chain.volume_metadata_unchanged().is_err());
+    }
+
     #[test]
     fn discovers_split_volumes_with_non_utf8_stem_bytes() {
         use std::os::unix::ffi::OsStrExt;

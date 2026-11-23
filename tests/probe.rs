@@ -106,6 +106,44 @@ fn worker_eof_and_stalled_input_are_bounded() {
 }
 
 #[test]
+fn worker_exit_with_descendant_holding_stdout_does_not_hang() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake-worker");
+    let marker = dir.path().join("descendant.pid");
+    // The child exits at once; a descendant keeps the stdout pipe open.
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n/bin/sleep 60 &\necho $! > '{}'\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let result = DecoderWorker::spawn(&fake, Path::new("ignored"), "");
+    let elapsed = start.elapsed();
+    assert!(result.is_err());
+    // Neither the 30 s exchange timeout nor the 60 s descendant is waited on.
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    let pid: i32 = fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    // The descendant shared the worker's process group and was killed with it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "descendant {pid} survived"
+    );
+}
+
+#[test]
 fn worker_rejects_oversize_entry_before_payload_response() {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("large.7z");
