@@ -175,6 +175,64 @@ pub struct DecoderWorker {
     watch_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watch_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+#[cfg(unix)]
+enum GroupSweep {
+    /// `waitpid` returned `ECHILD`: this process has no child in the group.
+    Empty { saw_leader: bool },
+    /// `waitpid` returned 0: a child in the group has not exited.
+    Live { saw_leader: bool },
+}
+
+#[cfg(unix)]
+enum GroupWait {
+    Reaped(i32),
+    /// `WNOHANG` and a child in the group has not exited. `errno` is unchanged.
+    Alive,
+    /// No child of this process is in the group.
+    Empty,
+    /// `waitpid` failed with something other than `EINTR` or `ECHILD`.
+    Failed,
+}
+
+/// One nonblocking drain of `pid`'s process group.
+///
+/// `0` (still alive) and `ECHILD` (empty) are different results. `EINTR` is
+/// retried inside [`wait_group`]. Any other error stays unfinished so the
+/// caller does not report the group collected.
+#[cfg(unix)]
+fn sweep_group(pid: i32) -> GroupSweep {
+    let mut saw_leader = false;
+    loop {
+        match wait_group(pid, libc::WNOHANG) {
+            GroupWait::Reaped(waited) if waited == pid => saw_leader = true,
+            GroupWait::Reaped(_) => {}
+            GroupWait::Empty => return GroupSweep::Empty { saw_leader },
+            GroupWait::Alive | GroupWait::Failed => return GroupSweep::Live { saw_leader },
+        }
+    }
+}
+
+/// `waitpid(-pid, flags)`, retrying `EINTR`.
+///
+/// A return of 0 is [`GroupWait::Alive`] and is not confused with `ECHILD`.
+#[cfg(unix)]
+fn wait_group(pid: i32, flags: libc::c_int) -> GroupWait {
+    loop {
+        let waited = unsafe { libc::waitpid(-pid, std::ptr::null_mut(), flags) };
+        if waited > 0 {
+            return GroupWait::Reaped(waited);
+        }
+        if waited == 0 {
+            return GroupWait::Alive;
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ECHILD) => return GroupWait::Empty,
+            _ => return GroupWait::Failed,
+        }
+    }
+}
+
 impl DecoderWorker {
     pub fn spawn(executable: &Path, archive: &Path, password: &str) -> Result<Self> {
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -293,9 +351,9 @@ impl DecoderWorker {
                     libc::kill(-pid, libc::SIGKILL);
                 }
                 if !Self::collect_group(pid, Duration::from_millis(200)) {
-                    // A late exit (for example after uninterruptible sleep)
-                    // must still be collected. The reaper blocks in waitpid,
-                    // which cannot observe a reused pid: this zombie holds it.
+                    // The leader has not been collected, or a descendant is
+                    // still alive (waitpid returned 0, not ECHILD). The reaper
+                    // blocks until the group is empty.
                     Self::reap_in_background(pid);
                 }
                 self.reaped = true;
@@ -307,72 +365,45 @@ impl DecoderWorker {
             }
         }
     }
-    /// Nonblocking collection of `pid`'s process group. True only when waitpid
-    /// has collected the leader itself.
+    /// Nonblocking collection of `pid`'s process group.
+    ///
+    /// True only when the leader has been collected and `waitpid` reports
+    /// `ECHILD` (no member remains). A return of 0 means a descendant is still
+    /// alive, which is not success: `stop` then hands the group to the
+    /// background reaper. `EINTR` is retried.
     #[cfg(unix)]
     fn collect_group(pid: i32, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
         let mut leader = false;
-        let mut idle_passes = 0u8;
         loop {
-            let mut reaped_any = false;
-            loop {
-                let waited = unsafe { libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) };
-                if waited == pid {
-                    leader = true;
-                    reaped_any = true;
-                    continue;
+            match sweep_group(pid) {
+                GroupSweep::Empty { saw_leader } => {
+                    leader |= saw_leader;
+                    return leader;
                 }
-                if waited > 0 {
-                    reaped_any = true;
-                    continue;
+                GroupSweep::Live { saw_leader } => {
+                    leader |= saw_leader;
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
                 }
-                break;
-            }
-            if reaped_any {
-                // A descendant can be reparented just after the leader is collected.
-                idle_passes = 0;
-                continue;
-            }
-            idle_passes = idle_passes.saturating_add(1);
-            if leader && idle_passes >= 2 {
-                break;
-            }
-            if Instant::now() >= deadline {
-                break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        leader
     }
 
-    /// Block until `pid` exits, then collect group members reparented to us.
+    /// Block until every child in `pid`'s process group has been collected.
+    ///
+    /// `waitpid` of 0 cannot occur without `WNOHANG`. `EINTR` is retried.
+    /// `ECHILD` means the group is empty, including a descendant that was
+    /// still running when the leader was collected.
     #[cfg(unix)]
     fn reap_in_background(pid: i32) {
-        thread::spawn(move || unsafe {
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let mut idle_passes = 0u8;
-            loop {
-                let mut reaped_any = false;
-                loop {
-                    if libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {
-                        reaped_any = true;
-                        continue;
-                    }
-                    break;
-                }
-                if reaped_any {
-                    idle_passes = 0;
-                    continue;
-                }
-                idle_passes = idle_passes.saturating_add(1);
-                if idle_passes >= 2 || Instant::now() >= deadline {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
+        thread::spawn(
+            move || {
+                while matches!(wait_group(pid, 0), GroupWait::Reaped(_)) {}
+            },
+        );
     }
 
     /// Whether the child has exited, without reaping it (the watchdog may
@@ -616,8 +647,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn uncollected_leader_is_reaped_after_it_exits() {
+        use std::os::unix::process::CommandExt;
         let child = std::process::Command::new("/bin/sleep")
             .arg("30")
+            .process_group(0)
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
@@ -638,5 +671,50 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("pid {pid} was still visible after the background reaper");
+    }
+
+    /// The leader is already a zombie and a second child in its group is still
+    /// running. `collect_group` must not report success: `waitpid` returns 0,
+    /// not `ECHILD`, and `stop` has to keep a reaper.
+    #[cfg(unix)]
+    #[test]
+    fn live_descendant_keeps_the_group_unfinished() {
+        use std::os::unix::process::CommandExt;
+        let leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        let descendant = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(pgid)
+            .spawn()
+            .unwrap();
+        let dpid = descendant.id() as i32;
+        assert_eq!(unsafe { libc::kill(pgid, libc::SIGKILL) }, 0);
+        assert!(
+            !DecoderWorker::collect_group(pgid, std::time::Duration::from_millis(50)),
+            "a live descendant must not count as a finished group"
+        );
+        assert_eq!(
+            unsafe { libc::kill(dpid, 0) },
+            0,
+            "descendant must still be alive when collection stops"
+        );
+        DecoderWorker::reap_in_background(pgid);
+        assert_eq!(unsafe { libc::kill(dpid, libc::SIGKILL) }, 0);
+        std::mem::forget(leader);
+        std::mem::forget(descendant);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let leader_gone = unsafe { libc::kill(pgid, 0) } != 0;
+            let descendant_gone = unsafe { libc::kill(dpid, 0) } != 0;
+            if leader_gone && descendant_gone {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("group {pgid} still had a zombie after the background reaper");
     }
 }
