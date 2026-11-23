@@ -284,39 +284,97 @@ impl DecoderWorker {
         }
         if !self.reaped {
             // The group leader is not reaped yet, so its PID (the group ID)
-            // cannot have been reused.
+            // cannot have been reused. `reaped` is set only after waitpid
+            // collects that pid, or after a background reaper owns the wait.
             #[cfg(unix)]
-            unsafe {
+            {
                 let pid = self.child.id() as i32;
-                libc::kill(-pid, libc::SIGKILL);
-                // SIGKILL and reparent-to-subreaper are not instantaneous.
-                // Keep collecting group zombies, or the descendant stays defunct.
-                let deadline = Instant::now() + Duration::from_millis(200);
-                loop {
-                    let mut reaped_any = false;
-                    loop {
-                        if libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {
-                            reaped_any = true;
-                            continue;
-                        }
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    if !reaped_any {
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
                 }
+                if !Self::collect_group(pid, Duration::from_millis(200)) {
+                    // A late exit (for example after uninterruptible sleep)
+                    // must still be collected. The reaper blocks in waitpid,
+                    // which cannot observe a reused pid: this zombie holds it.
+                    Self::reap_in_background(pid);
+                }
+                self.reaped = true;
             }
             #[cfg(not(unix))]
             {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                self.reaped = self.child.wait().is_ok();
             }
-            self.reaped = true;
         }
     }
+    /// Nonblocking collection of `pid`'s process group. True only when waitpid
+    /// has collected the leader itself.
+    #[cfg(unix)]
+    fn collect_group(pid: i32, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        let mut leader = false;
+        let mut idle_passes = 0u8;
+        loop {
+            let mut reaped_any = false;
+            loop {
+                let waited = unsafe { libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if waited == pid {
+                    leader = true;
+                    reaped_any = true;
+                    continue;
+                }
+                if waited > 0 {
+                    reaped_any = true;
+                    continue;
+                }
+                break;
+            }
+            if reaped_any {
+                // A descendant can be reparented just after the leader is collected.
+                idle_passes = 0;
+                continue;
+            }
+            idle_passes = idle_passes.saturating_add(1);
+            if leader && idle_passes >= 2 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        leader
+    }
+
+    /// Block until `pid` exits, then collect group members reparented to us.
+    #[cfg(unix)]
+    fn reap_in_background(pid: i32) {
+        thread::spawn(move || unsafe {
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut idle_passes = 0u8;
+            loop {
+                let mut reaped_any = false;
+                loop {
+                    if libc::waitpid(-pid, std::ptr::null_mut(), libc::WNOHANG) > 0 {
+                        reaped_any = true;
+                        continue;
+                    }
+                    break;
+                }
+                if reaped_any {
+                    idle_passes = 0;
+                    continue;
+                }
+                idle_passes = idle_passes.saturating_add(1);
+                if idle_passes >= 2 || Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
     /// Whether the child has exited, without reaping it (the watchdog may
     /// still signal its PID).
     fn child_exited(&self) -> bool {
@@ -452,6 +510,9 @@ impl ArchiveSource for DecoderWorker {
         let data = self
             .exchange(&serde_json::to_vec(&(path, offset, length)).map_err(|e| e.to_string())?)?;
         if data.len() > length {
+            // A reply larger than the request is a broken worker, not a
+            // logical read error. Do not use it again.
+            self.stop();
             return Err("worker returned more than the requested range".into());
         }
         Ok(data)
@@ -550,5 +611,32 @@ mod tests {
                 .contains("exceeds limit")
         );
         assert_eq!(frame_read(&mut cursor, MAX_RESPONSE).unwrap(), b"\0next");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncollected_leader_is_reaped_after_it_exits() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        assert!(
+            !DecoderWorker::collect_group(pid, std::time::Duration::ZERO),
+            "a live child must not count as collected"
+        );
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        DecoderWorker::reap_in_background(pid);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        // Dropping Child would not wait. Forget it so only the reaper collects.
+        std::mem::forget(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("pid {pid} was still visible after the background reaper");
     }
 }

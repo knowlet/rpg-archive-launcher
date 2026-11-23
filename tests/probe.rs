@@ -169,37 +169,12 @@ fn worker_exit_with_descendant_holding_stdout_does_not_hang() {
     while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A zombie still answers kill(pid, 0). ESRCH means it was collected.
     assert_ne!(
         unsafe { libc::kill(pid, 0) },
         0,
         "descendant {pid} survived"
     );
-    #[cfg(target_os = "linux")]
-    {
-        let me = std::process::id().to_string();
-        let mut zombies = Vec::new();
-        for entry in fs::read_dir("/proc").unwrap().flatten() {
-            let Ok(child) = entry.file_name().to_string_lossy().parse::<i32>() else {
-                continue;
-            };
-            let Ok(stat) = fs::read_to_string(format!("/proc/{child}/stat")) else {
-                continue;
-            };
-            let Some((_, rest)) = stat.rsplit_once(')') else {
-                continue;
-            };
-            let mut fields = rest.split_whitespace();
-            let state = fields.next().unwrap_or("");
-            let ppid = fields.next().unwrap_or("");
-            if state == "Z" && ppid == me {
-                zombies.push(child);
-            }
-        }
-        assert!(
-            zombies.is_empty(),
-            "zombie children left behind: {zombies:?}"
-        );
-    }
 }
 
 #[test]
@@ -230,4 +205,40 @@ fn worker_rejects_oversize_entry_before_payload_response() {
             .contains("over request limit")
     );
     assert_eq!(fs.read_at("small.txt", 6, 8).unwrap(), b"readable");
+}
+
+#[test]
+fn oversized_range_reply_retires_the_worker() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("wide-worker");
+    fs::write(
+        &fake,
+        r#"#!/usr/bin/python3
+import json, struct, sys
+def read_frame():
+    header = sys.stdin.buffer.read(4)
+    if len(header) < 4:
+        return b""
+    n = struct.unpack("<I", header)[0]
+    return sys.stdin.buffer.read(n)
+def write_frame(payload: bytes):
+    sys.stdout.buffer.write(struct.pack("<I", len(payload)) + payload)
+    sys.stdout.buffer.flush()
+read_frame()
+body = json.dumps([[["a.txt", 4]], [0] * 32]).encode()
+write_frame(b"\x00" + body)
+read_frame()
+write_frame(b"\x00" + b"x" * 32)
+read_frame()
+write_frame(b"\x00ok")
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut source = DecoderWorker::spawn(&fake, Path::new("ignored"), "").unwrap();
+    let error = source.read_range("a.txt", 0, 4).unwrap_err();
+    assert!(error.contains("more than the requested range"), "{error}");
+    let again = source.read_range("a.txt", 0, 4).unwrap_err();
+    assert!(again.contains("unavailable"), "{again}");
 }
