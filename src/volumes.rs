@@ -431,13 +431,22 @@ mod tests {
     #[test]
     fn discovers_split_volumes_with_non_utf8_stem_bytes() {
         use std::os::unix::ffi::OsStrExt;
-        let temp = tempfile::tempdir().unwrap();
         let stem = OsStr::from_bytes(b"G\xe9me.7z");
+        let first_name = volume_part_name(stem, 1);
+        let (parsed, vol) = parse_volume_suffix_os(&first_name);
+        assert_eq!(vol, Some(1));
+        assert_eq!(parsed.as_bytes(), b"G\xe9me.7z");
+        let temp = tempfile::tempdir().unwrap();
         for index in 1..=2 {
             let name = volume_part_name(stem, index);
-            std::fs::write(temp.path().join(&name), format!("p{index}").as_bytes()).unwrap();
+            if let Err(error) = std::fs::write(temp.path().join(&name), format!("p{index}")) {
+                // APFS rejects names that are not Unicode. The byte parser above
+                // still runs; a volume with this stem cannot exist on that host.
+                assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+                return;
+            }
         }
-        let first = temp.path().join(volume_part_name(stem, 1));
+        let first = temp.path().join(first_name);
         assert_eq!(resolve_archive(&first).unwrap().len(), 2);
     }
 
