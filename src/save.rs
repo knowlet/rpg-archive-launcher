@@ -48,10 +48,9 @@ struct Binding {
 type Changes = Vec<(String, Entry)>;
 
 pub struct Store {
-    /// Same-process exclusion plus the POSIX record lock. Dropped before
-    /// `file` so the record lock is released while the descriptor is open.
+    /// Dropped before `file`, so the owner can unlock while the descriptor
+    /// is still open. An inherited handle does not unlock.
     #[cfg(unix)]
-    #[allow(dead_code)]
     lock: ProcessLock,
     file: File,
     entries: BTreeMap<String, Entry>,
@@ -103,179 +102,67 @@ pub fn validate_key(key: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// `flock` held by a helper process on its own open file description.
+/// Exclusive `flock` on this store's own descriptor, owned by one process.
 ///
-/// `flock` on this process's descriptor is inherited across `fork` until
-/// `exec`, so a child can keep the WAL locked after this handle is dropped.
-/// A POSIX record lock is not inherited, but closing any descriptor for the
-/// file (including a read of the WAL) releases it. The helper opens the
-/// inode itself and is the only holder of that description.
+/// The lock lives on `fd`, which stays open for the life of the `Store`.
+/// A forked child inherits that descriptor. Closing the child's dup does
+/// not release the lock while this process still holds it, and `LOCK_UN`
+/// from the child would. Only the acquiring pid unlocks. `LOCK_UN` releases
+/// the open-file description even if a child still has a dup, so dropping
+/// the owner does not leave the lock held until that child execs.
 #[cfg(unix)]
 struct ProcessLock {
-    pid: libc::pid_t,
-    socket: std::os::unix::io::RawFd,
+    owner: libc::pid_t,
+    fd: std::os::unix::io::RawFd,
 }
 
 #[cfg(unix)]
-fn raw_errno() -> i32 {
-    unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            *libc::__error()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            *libc::__errno_location()
-        }
-    }
-}
-
-#[cfg(unix)]
-fn write_byte(fd: libc::c_int, value: u8) {
-    let byte = [value];
-    unsafe {
-        loop {
-            if libc::write(fd, byte.as_ptr().cast(), 1) == 1 || raw_errno() != libc::EINTR {
-                return;
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn read_byte(fd: libc::c_int) -> io::Result<u8> {
-    let mut byte = [0u8; 1];
+fn flock_retry(fd: std::os::unix::io::RawFd, operation: libc::c_int) -> io::Result<()> {
     loop {
-        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
-        if n == 1 {
-            return Ok(byte[0]);
-        }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "save lock helper exited",
-            ));
+        let rc = unsafe { libc::flock(fd, operation) };
+        if rc == 0 {
+            return Ok(());
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
-            return Err(err);
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
         }
-    }
-}
-
-#[cfg(unix)]
-fn reap_helper(pid: libc::pid_t) {
-    loop {
-        let mut status = 0;
-        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if rc == pid || raw_errno() != libc::EINTR {
-            return;
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "save store is already open",
+            ));
         }
-    }
-}
-
-/// Runs only in the forked helper. Every call here is async-signal-safe.
-///
-/// Status byte: 0 locked, 1 already locked, 2 the path is not `dev`/`ino`.
-#[cfg(unix)]
-fn lock_helper(
-    sock: libc::c_int,
-    parent_sock: libc::c_int,
-    path: *const libc::c_char,
-    dev: u64,
-    ino: u64,
-) -> ! {
-    unsafe {
-        libc::close(parent_sock);
-        let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        if fd < 0 {
-            write_byte(sock, 2);
-            libc::_exit(1);
-        }
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 || st.st_dev as u64 != dev || st.st_ino as u64 != ino {
-            write_byte(sock, 2);
-            libc::_exit(1);
-        }
-        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            write_byte(sock, 1);
-            libc::_exit(1);
-        }
-        write_byte(sock, 0);
-        let mut byte = [0u8; 1];
-        loop {
-            let n = libc::read(sock, byte.as_mut_ptr().cast(), 1);
-            if n >= 0 || raw_errno() != libc::EINTR {
-                break;
-            }
-        }
-        let _ = libc::flock(fd, libc::LOCK_UN);
-        libc::_exit(0);
+        return Err(err);
     }
 }
 
 #[cfg(unix)]
 impl ProcessLock {
-    fn acquire(path: &Path, dev: u64, ino: u64) -> io::Result<Self> {
-        use std::os::unix::ffi::OsStrExt;
-        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "save path contains an interior nul",
-            )
-        })?;
-        let mut sv = [0; 2];
-        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for fd in sv {
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            let err = io::Error::last_os_error();
-            unsafe {
-                libc::close(sv[0]);
-                libc::close(sv[1]);
-            }
-            return Err(err);
-        }
-        if pid == 0 {
-            lock_helper(sv[1], sv[0], path_c.as_ptr(), dev, ino);
-        }
-        unsafe { libc::close(sv[1]) };
-        match read_byte(sv[0]) {
-            Ok(0) => Ok(Self { pid, socket: sv[0] }),
-            Ok(1) => {
-                unsafe { libc::close(sv[0]) };
-                reap_helper(pid);
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "save store is already open",
-                ))
-            }
-            Ok(_) => {
-                unsafe { libc::close(sv[0]) };
-                reap_helper(pid);
-                Err(io::Error::other(
-                    "save lock helper could not lock the store inode",
-                ))
-            }
-            Err(err) => {
-                unsafe { libc::close(sv[0]) };
-                reap_helper(pid);
-                Err(err)
-            }
-        }
+    fn acquire(file: &File) -> io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        flock_retry(fd, libc::LOCK_EX | libc::LOCK_NB)?;
+        Ok(Self {
+            // `std::process::id` is cached and does not change across fork.
+            owner: unsafe { libc::getpid() },
+            fd,
+        })
+    }
+
+    fn owned_here(&self) -> bool {
+        unsafe { libc::getpid() == self.owner }
     }
 }
 
 #[cfg(unix)]
 impl Drop for ProcessLock {
     fn drop(&mut self) {
-        write_byte(self.socket, 1);
-        unsafe { libc::close(self.socket) };
-        reap_helper(self.pid);
+        if !self.owned_here() {
+            // Inherited handle: the file drop closes only this process's dup.
+            return;
+        }
+        let _ = flock_retry(self.fd, libc::LOCK_UN);
     }
 }
 
@@ -327,10 +214,7 @@ impl Store {
                     "save store must not grant group or other permissions",
                 ));
             }
-            // The helper, not this descriptor, owns the `flock`. A child of
-            // this process can inherit this descriptor until exec; that dup
-            // must not keep the next open blocked. See `ProcessLock`.
-            let lock = ProcessLock::acquire(path, meta.dev(), meta.ino())?;
+            let lock = ProcessLock::acquire(&file)?;
             if file.metadata()?.len() > MAX_WAL_BYTES {
                 return Err(invalid("save WAL exceeds 256 MiB limit"));
             }
@@ -443,6 +327,13 @@ impl Store {
     }
 
     fn ensure_healthy(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if !self.lock.owned_here() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "save store belongs to the process that opened it",
+            ));
+        }
         if self.poisoned {
             return Err(io::Error::other(
                 "save handle needs reopening after failed write",
@@ -771,6 +662,7 @@ fn checksum(bytes: &[u8]) -> u32 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -897,10 +789,10 @@ mod tests {
     }
 
     /// A forked child keeps a dup of the WAL descriptor until it execs or
-    /// exits. `Command` waits for exec, so this uses `fork` and pauses in
-    /// the child with only async-signal-safe calls. `flock` would still be
-    /// held by that dup after the parent closed its own; a record lock must
-    /// not be. The descriptor is close-on-exec, which only helps after exec.
+    /// exits. The owner drop issues `LOCK_UN`, which releases that shared
+    /// description immediately. Close-on-exec does not cover the interval
+    /// before exec, and closing the owner's descriptor alone would not either
+    /// while the child still holds its dup.
     #[cfg(unix)]
     #[test]
     fn fork_before_exec_does_not_keep_the_store_lock() {
@@ -945,6 +837,196 @@ mod tests {
         assert!(
             opened,
             "WAL lock survived a child that still held the descriptor"
+        );
+    }
+
+    /// Run `case` in a fresh process so `fork` is not racing this test binary's
+    /// other threads. Returns true when this call was the supervisor.
+    #[cfg(unix)]
+    fn supervise_lock_case(case: &str, test_name: &str) -> bool {
+        if std::env::var("RPG_SAVE_LOCK_CASE").ok().as_deref() == Some(case) {
+            return false;
+        }
+        let temp = Temp::new();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("RPG_SAVE_LOCK_CASE", case)
+            .env("RPG_SAVE_LOCK_PATH", temp.path())
+            .env("RUST_TEST_THREADS", "1")
+            .arg(test_name)
+            .arg("--exact")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{case} supervisor status: {status}");
+        true
+    }
+
+    #[cfg(unix)]
+    fn direct_child_pids() -> BTreeSet<i32> {
+        #[cfg(target_os = "linux")]
+        {
+            let me = unsafe { libc::getpid() }.to_string();
+            let mut pids = BTreeSet::new();
+            let Ok(entries) = fs::read_dir("/proc") else {
+                return pids;
+            };
+            for entry in entries.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+                    continue;
+                };
+                if status.lines().any(|line| {
+                    line.strip_prefix("PPid:")
+                        .is_some_and(|ppid| ppid.trim() == me)
+                }) {
+                    pids.insert(pid);
+                }
+            }
+            pids
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let me = unsafe { libc::getpid() };
+            let bytes = unsafe { libc::proc_listchildpids(me, std::ptr::null_mut(), 0) };
+            if bytes <= 0 {
+                return BTreeSet::new();
+            }
+            let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
+            let mut buf = vec![0 as libc::pid_t; count.max(1)];
+            let written = unsafe {
+                libc::proc_listchildpids(
+                    me,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+                )
+            };
+            if written <= 0 {
+                return BTreeSet::new();
+            }
+            let n = (written as usize).min(buf.len());
+            buf.truncate(n);
+            buf.into_iter().filter(|pid| *pid > 0).collect()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            BTreeSet::new()
+        }
+    }
+
+    /// The child's `Store` drop must not unlock. A second open stays blocked
+    /// until the process that called `open` drops its handle, and the child
+    /// cannot append its own record.
+    #[cfg(unix)]
+    #[test]
+    fn inherited_drop_keeps_the_lock_until_the_owner_drops() {
+        const CASE: &str = "inherit";
+        const NAME: &str = "save::tests::inherited_drop_keeps_the_lock_until_the_owner_drops";
+        if supervise_lock_case(CASE, NAME) {
+            return;
+        }
+        let path = std::env::var("RPG_SAVE_LOCK_PATH").unwrap();
+        let mut owner = Store::open(&path).unwrap();
+        owner.put("parent", b"kept").unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut notify = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(unsafe { libc::pipe(notify.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            let rejected = owner.put("child", b"stolen").is_err();
+            drop(owner);
+            unsafe {
+                let byte = [u8::from(rejected)];
+                let _ = libc::write(notify[1], byte.as_ptr().cast(), 1);
+                let mut byte = [0u8; 1];
+                let _ = libc::read(release[0], byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(notify[0], byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(byte[0], 1, "inherited handle accepted a write");
+        assert!(
+            Store::open(&path).is_err(),
+            "child drop released the owner's lock"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(owner);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.get("parent").unwrap(), Some(b"kept".to_vec()));
+        assert_eq!(reopened.get("child").unwrap(), None);
+        drop(reopened);
+        assert_eq!(
+            unsafe { libc::write(release[1], [1u8].as_ptr().cast(), 1) },
+            1
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        for fd in [notify[0], notify[1], release[0], release[1]] {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// The locked description is this process's store fd. A child created by
+    /// `open` (the previous helper) dying must not let another opener in
+    /// while this handle still accepts writes.
+    #[cfg(unix)]
+    #[test]
+    fn store_keeps_the_lock_if_an_open_child_dies() {
+        const CASE: &str = "holder";
+        const NAME: &str = "save::tests::store_keeps_the_lock_if_an_open_child_dies";
+        if supervise_lock_case(CASE, NAME) {
+            return;
+        }
+        let path = std::env::var("RPG_SAVE_LOCK_PATH").unwrap();
+        let before = direct_child_pids();
+        let mut store = Store::open(&path).unwrap();
+        let spawned: Vec<i32> = direct_child_pids().difference(&before).copied().collect();
+        for pid in &spawned {
+            assert_eq!(unsafe { libc::kill(*pid, libc::SIGKILL) }, 0);
+        }
+        for pid in &spawned {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(*pid, &mut status, 0) }, *pid);
+        }
+        assert!(
+            Store::open(&path).is_err(),
+            "lock disappeared with a child of open"
+        );
+        store.put("a", b"b").unwrap();
+        assert_eq!(store.get("a").unwrap(), Some(b"b".to_vec()));
+    }
+
+    /// `open` must not leave an inherited write end of an unrelated pipe
+    /// open, or a reader will not see EOF until the store is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn open_does_not_inherit_unrelated_descriptors() {
+        let temp = Temp::new();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut byte = [0u8; 1];
+        let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(pipe[0]) };
+        drop(store);
+        assert_eq!(
+            n, 0,
+            "pipe write end stayed open after the parent closed it: {err}"
         );
     }
 
