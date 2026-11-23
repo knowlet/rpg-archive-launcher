@@ -70,6 +70,33 @@ fn encrypted_mv_mz_worker_reads_and_isolated_upper() {
     }
 }
 #[test]
+fn worker_range_reads_are_sliced_in_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("range.7z");
+    fixture(&archive, "rpg_core");
+    let mut source = worker(&archive, "秘密🔑").unwrap();
+    assert_eq!(source.read_range("遊戲/index.html", 2, 4).unwrap(), b"nthe");
+    assert_eq!(
+        source.read_range("遊戲/index.html", 10, 1 << 20).unwrap(),
+        b"only"
+    );
+    assert!(
+        source
+            .read_range("遊戲/index.html", 14, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        source
+            .read_range("遊戲/index.html", u64::MAX, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(source.read_range("遊戲/missing", 0, 4).is_err());
+    // A logical error leaves the worker usable.
+    assert_eq!(source.read("遊戲/index.html").unwrap(), b"synthetic only");
+}
+#[test]
 fn source_mutation_invalidates_cached_read() {
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();

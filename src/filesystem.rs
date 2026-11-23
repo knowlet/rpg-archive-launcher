@@ -206,19 +206,15 @@ impl<S: ArchiveSource> Filesystem<S> {
             match upper.lookup(key).map_err(|e| e.to_string())? {
                 Some(Entry::Data(data)) => data,
                 Some(Entry::Deleted) => return Err("file not found".into()),
-                None => self.source.read(key)?,
+                None => return self.source.read_range(key, offset, length),
             }
         } else {
-            self.source.read(key)?
+            return self.source.read_range(key, offset, length);
         };
         if data.len() > 16 * 1024 * 1024 {
             return Err("source response exceeds limit".into());
         }
-        if offset >= data.len() as u64 {
-            return Ok(Vec::new());
-        }
-        let start = offset as usize;
-        Ok(data[start..start + length.min(data.len() - start)].to_vec())
+        Ok(crate::archive::slice_range(data, offset, length))
     }
     fn writable(&self, path: &str) -> Result<()> {
         let (_, prefix) = self.upper.as_ref().ok_or("read-only filesystem")?;
@@ -295,6 +291,60 @@ impl<S: ArchiveSource> Filesystem<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lower_reads_request_only_the_range_from_the_source() {
+        struct Counting {
+            data: Vec<u8>,
+            full_reads: usize,
+            served: usize,
+        }
+        impl ArchiveSource for Counting {
+            fn entries(&self) -> Vec<(String, Option<u64>)> {
+                vec![("big.bin".into(), Some(self.data.len() as u64))]
+            }
+            fn read(&mut self, _: &str) -> Result<Vec<u8>> {
+                self.full_reads += 1;
+                self.served += self.data.len();
+                Ok(self.data.clone())
+            }
+            fn read_range(&mut self, _: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+                let part = crate::archive::slice_range(self.data.clone(), offset, length);
+                self.served += part.len();
+                Ok(part)
+            }
+            fn revision_sha256(&mut self) -> Result<[u8; 32]> {
+                Ok([7; 32])
+            }
+        }
+        let data: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect();
+        let mut fs = Filesystem::readonly(Counting {
+            data: data.clone(),
+            full_reads: 0,
+            served: 0,
+        })
+        .unwrap();
+        for chunk in 0..16u64 {
+            let offset = chunk * 4096;
+            assert_eq!(
+                fs.read_at("big.bin", offset, 4096).unwrap(),
+                &data[offset as usize..offset as usize + 4096]
+            );
+        }
+        assert!(
+            fs.read_at("big.bin", data.len() as u64, 4096)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs.read_at("big.bin", data.len() as u64 - 3, 4096)
+                .unwrap()
+                .len(),
+            3
+        );
+        // 16 reads of 4 KiB move 64 KiB, not 16 copies of the 4 MiB entry.
+        assert_eq!(fs.source.full_reads, 0);
+        assert_eq!(fs.source.served, 16 * 4096 + 3);
+    }
     struct Synthetic(BTreeMap<String, Vec<u8>>);
     impl ArchiveSource for Synthetic {
         fn entries(&self) -> Vec<(String, Option<u64>)> {

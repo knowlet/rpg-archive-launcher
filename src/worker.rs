@@ -135,11 +135,27 @@ pub fn serve() -> Result<()> {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e.to_string()),
             };
-            let path: Option<String> =
+            // null: revalidate the source; "path": whole entry;
+            // ["path", offset, length]: a slice cut here, not in the parent.
+            let request: serde_json::Value =
                 serde_json::from_slice(&request).map_err(|e| e.to_string())?;
-            let result = match path {
-                Some(p) => archive.read(&p),
-                None => archive.ensure_source_unchanged().map(|()| Vec::new()),
+            let result = match request {
+                serde_json::Value::Null => archive.ensure_source_unchanged().map(|()| Vec::new()),
+                serde_json::Value::String(p) => archive.read(&p),
+                serde_json::Value::Array(items) => match items.as_slice() {
+                    [
+                        serde_json::Value::String(p),
+                        serde_json::Value::Number(offset),
+                        serde_json::Value::Number(length),
+                    ] => match (offset.as_u64(), length.as_u64()) {
+                        (Some(offset), Some(length)) if length < MAX_RESPONSE as u64 => archive
+                            .read(p)
+                            .map(|data| crate::archive::slice_range(data, offset, length as usize)),
+                        _ => Err("invalid range request".into()),
+                    },
+                    _ => return Err("malformed worker request".into()),
+                },
+                _ => return Err("malformed worker request".into()),
             };
             response(&mut output, result).map_err(|e| e.to_string())?;
         }
@@ -407,6 +423,15 @@ impl ArchiveSource for DecoderWorker {
     fn read(&mut self, path: &str) -> Result<Vec<u8>> {
         crate::archive::validate_archive_path(path)?;
         self.exchange(&serde_json::to_vec(&Some(path)).map_err(|e| e.to_string())?)
+    }
+    fn read_range(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        crate::archive::validate_archive_path(path)?;
+        let data = self
+            .exchange(&serde_json::to_vec(&(path, offset, length)).map_err(|e| e.to_string())?)?;
+        if data.len() > length {
+            return Err("worker returned more than the requested range".into());
+        }
+        Ok(data)
     }
     fn revision_sha256(&mut self) -> Result<[u8; 32]> {
         self.exchange(b"null")?;

@@ -130,7 +130,24 @@ fn source_stamp(source: &File) -> Result<SourceStamp> {
 pub trait ArchiveSource {
     fn entries(&self) -> Vec<(String, Option<u64>)>;
     fn read(&mut self, path: &str) -> Result<Vec<u8>>;
+    /// At most `length` bytes from `offset`; empty at or past the end. A
+    /// supervised worker slices in the child so a small read of a large
+    /// entry does not transfer the whole entry.
+    fn read_range(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        Ok(slice_range(self.read(path)?, offset, length))
+    }
     fn revision_sha256(&mut self) -> Result<[u8; 32]>;
+}
+
+pub(crate) fn slice_range(mut data: Vec<u8>, offset: u64, length: usize) -> Vec<u8> {
+    if offset >= data.len() as u64 {
+        return Vec::new();
+    }
+    let start = offset as usize;
+    let end = start + length.min(data.len() - start);
+    data.truncate(end);
+    data.drain(..start);
+    data
 }
 
 /// Strict portable relative path policy. No URL decoding is performed here.
