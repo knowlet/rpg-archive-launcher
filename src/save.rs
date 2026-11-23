@@ -14,7 +14,6 @@
 //! Every Unix open syncs the parent directory. On other platforms this implementation
 //! fails closed rather than claiming equivalent symlink/directory durability.
 
-use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -49,6 +48,11 @@ struct Binding {
 type Changes = Vec<(String, Entry)>;
 
 pub struct Store {
+    /// Same-process exclusion plus the POSIX record lock. Dropped before
+    /// `file` so the record lock is released while the descriptor is open.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    lock: ProcessLock,
     file: File,
     entries: BTreeMap<String, Entry>,
     live_bytes: usize,
@@ -99,6 +103,182 @@ pub fn validate_key(key: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// `flock` held by a helper process on its own open file description.
+///
+/// `flock` on this process's descriptor is inherited across `fork` until
+/// `exec`, so a child can keep the WAL locked after this handle is dropped.
+/// A POSIX record lock is not inherited, but closing any descriptor for the
+/// file (including a read of the WAL) releases it. The helper opens the
+/// inode itself and is the only holder of that description.
+#[cfg(unix)]
+struct ProcessLock {
+    pid: libc::pid_t,
+    socket: std::os::unix::io::RawFd,
+}
+
+#[cfg(unix)]
+fn raw_errno() -> i32 {
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            *libc::__error()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            *libc::__errno_location()
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_byte(fd: libc::c_int, value: u8) {
+    let byte = [value];
+    unsafe {
+        loop {
+            if libc::write(fd, byte.as_ptr().cast(), 1) == 1 || raw_errno() != libc::EINTR {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_byte(fd: libc::c_int) -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        if n == 1 {
+            return Ok(byte[0]);
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "save lock helper exited",
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reap_helper(pid: libc::pid_t) {
+    loop {
+        let mut status = 0;
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if rc == pid || raw_errno() != libc::EINTR {
+            return;
+        }
+    }
+}
+
+/// Runs only in the forked helper. Every call here is async-signal-safe.
+///
+/// Status byte: 0 locked, 1 already locked, 2 the path is not `dev`/`ino`.
+#[cfg(unix)]
+fn lock_helper(
+    sock: libc::c_int,
+    parent_sock: libc::c_int,
+    path: *const libc::c_char,
+    dev: u64,
+    ino: u64,
+) -> ! {
+    unsafe {
+        libc::close(parent_sock);
+        let fd = libc::open(path, libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if fd < 0 {
+            write_byte(sock, 2);
+            libc::_exit(1);
+        }
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 || st.st_dev as u64 != dev || st.st_ino as u64 != ino {
+            write_byte(sock, 2);
+            libc::_exit(1);
+        }
+        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            write_byte(sock, 1);
+            libc::_exit(1);
+        }
+        write_byte(sock, 0);
+        let mut byte = [0u8; 1];
+        loop {
+            let n = libc::read(sock, byte.as_mut_ptr().cast(), 1);
+            if n >= 0 || raw_errno() != libc::EINTR {
+                break;
+            }
+        }
+        let _ = libc::flock(fd, libc::LOCK_UN);
+        libc::_exit(0);
+    }
+}
+
+#[cfg(unix)]
+impl ProcessLock {
+    fn acquire(path: &Path, dev: u64, ino: u64) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save path contains an interior nul",
+            )
+        })?;
+        let mut sv = [0; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in sv {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::close(sv[0]);
+                libc::close(sv[1]);
+            }
+            return Err(err);
+        }
+        if pid == 0 {
+            lock_helper(sv[1], sv[0], path_c.as_ptr(), dev, ino);
+        }
+        unsafe { libc::close(sv[1]) };
+        match read_byte(sv[0]) {
+            Ok(0) => Ok(Self { pid, socket: sv[0] }),
+            Ok(1) => {
+                unsafe { libc::close(sv[0]) };
+                reap_helper(pid);
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "save store is already open",
+                ))
+            }
+            Ok(_) => {
+                unsafe { libc::close(sv[0]) };
+                reap_helper(pid);
+                Err(io::Error::other(
+                    "save lock helper could not lock the store inode",
+                ))
+            }
+            Err(err) => {
+                unsafe { libc::close(sv[0]) };
+                reap_helper(pid);
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        write_byte(self.socket, 1);
+        unsafe { libc::close(self.socket) };
+        reap_helper(self.pid);
+    }
+}
+
 fn cost(key: &str, value: &Entry) -> usize {
     // Conservative per-entry allowance bounds tiny-key map/allocator overhead.
     key.len() * 2
@@ -147,7 +327,10 @@ impl Store {
                     "save store must not grant group or other permissions",
                 ));
             }
-            FileExt::try_lock_exclusive(&file)?;
+            // The helper, not this descriptor, owns the `flock`. A child of
+            // this process can inherit this descriptor until exec; that dup
+            // must not keep the next open blocked. See `ProcessLock`.
+            let lock = ProcessLock::acquire(path, meta.dev(), meta.ino())?;
             if file.metadata()?.len() > MAX_WAL_BYTES {
                 return Err(invalid("save WAL exceeds 256 MiB limit"));
             }
@@ -178,6 +361,7 @@ impl Store {
                 return Err(invalid("unrecognized save store format"));
             }
             let mut store = Self {
+                lock,
                 file,
                 entries: BTreeMap::new(),
                 live_bytes: 0,
@@ -698,6 +882,10 @@ mod tests {
         let temp = Temp::new();
         let s = Store::open(temp.path()).unwrap();
         assert!(Store::open(temp.path()).is_err());
+        // A separate open/close of the same inode must not drop the lock.
+        // POSIX record locks are released by any close of the file.
+        drop(fs::File::open(temp.path()).unwrap());
+        assert!(Store::open(temp.path()).is_err());
         drop(s);
         let alias = temp.0.join("alias");
         symlink(temp.path(), &alias).unwrap();
@@ -706,6 +894,58 @@ mod tests {
         let hard = temp.0.join("hard");
         fs::hard_link(temp.path(), &hard).unwrap();
         assert!(Store::open(&hard).is_err());
+    }
+
+    /// A forked child keeps a dup of the WAL descriptor until it execs or
+    /// exits. `Command` waits for exec, so this uses `fork` and pauses in
+    /// the child with only async-signal-safe calls. `flock` would still be
+    /// held by that dup after the parent closed its own; a record lock must
+    /// not be. The descriptor is close-on-exec, which only helps after exec.
+    #[cfg(unix)]
+    #[test]
+    fn fork_before_exec_does_not_keep_the_store_lock() {
+        use std::os::unix::io::AsRawFd;
+        let temp = Temp::new();
+        let store = Store::open(temp.path()).unwrap();
+        let flags = unsafe { libc::fcntl(store.file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && (flags & libc::FD_CLOEXEC) != 0);
+        let mut notify = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(unsafe { libc::pipe(notify.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                let byte = [1u8];
+                let _ = libc::write(notify[1], byte.as_ptr().cast(), 1);
+                let mut byte = [0u8; 1];
+                let _ = libc::read(release[0], byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(notify[0], byte.as_mut_ptr().cast(), 1) },
+            1
+        );
+        drop(store);
+        let reopened = Store::open(temp.path());
+        let opened = reopened.is_ok();
+        drop(reopened);
+        assert_eq!(
+            unsafe { libc::write(release[1], [1u8].as_ptr().cast(), 1) },
+            1
+        );
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        for fd in [notify[0], notify[1], release[0], release[1]] {
+            unsafe { libc::close(fd) };
+        }
+        assert!(
+            opened,
+            "WAL lock survived a child that still held the descriptor"
+        );
     }
 
     #[test]
