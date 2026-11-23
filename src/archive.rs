@@ -33,30 +33,30 @@ impl Default for Limits {
     }
 }
 
-enum ArchiveSource {
+enum OpenedSource {
     File(File),
     Volumes(VolumeChain),
 }
 
-impl Read for ArchiveSource {
+impl Read for OpenedSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            ArchiveSource::File(file) => file.read(buf),
-            ArchiveSource::Volumes(chain) => chain.read(buf),
+            OpenedSource::File(file) => file.read(buf),
+            OpenedSource::Volumes(chain) => chain.read(buf),
         }
     }
 }
 
-impl Seek for ArchiveSource {
+impl Seek for OpenedSource {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match self {
-            ArchiveSource::File(file) => file.seek(pos),
-            ArchiveSource::Volumes(chain) => chain.seek(pos),
+            OpenedSource::File(file) => file.seek(pos),
+            OpenedSource::Volumes(chain) => chain.seek(pos),
         }
     }
 }
 
-impl ArchiveSource {
+impl OpenedSource {
     fn open_single(path: &Path) -> Result<Self> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -69,50 +69,21 @@ impl ArchiveSource {
         if !file.metadata().map_err(|e| e.to_string())?.is_file() {
             return Err("archive source must be a regular file".into());
         }
-        Ok(ArchiveSource::File(file))
-    }
-
-    fn metadata_snapshot(&self) -> Result<(u64, Option<std::time::SystemTime>)> {
-        match self {
-            ArchiveSource::File(file) => {
-                let meta = file.metadata().map_err(|e| e.to_string())?;
-                Ok((meta.len(), meta.modified().ok()))
-            }
-            ArchiveSource::Volumes(chain) => Ok((chain.total_len(), None)),
-        }
+        Ok(OpenedSource::File(file))
     }
 
     fn stream_position(&mut self) -> Result<u64> {
         Ok(match self {
-            ArchiveSource::File(file) => file.stream_position().map_err(|e| e.to_string())?,
-            ArchiveSource::Volumes(chain) => chain.logical_position(),
+            OpenedSource::File(file) => file.stream_position().map_err(|e| e.to_string())?,
+            OpenedSource::Volumes(chain) => chain.logical_position(),
         })
-    }
-
-    fn verify_unchanged(
-        &self,
-        before_len: u64,
-        before_mtime: Option<std::time::SystemTime>,
-    ) -> Result<()> {
-        match self {
-            ArchiveSource::File(file) => {
-                let meta = file.metadata().map_err(|e| e.to_string())?;
-                if meta.len() != before_len || meta.modified().ok() != before_mtime {
-                    return Err("archive changed while computing its revision".into());
-                }
-            }
-            ArchiveSource::Volumes(chain) => {
-                chain
-                    .volume_metadata_unchanged()
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
     }
 }
 
 pub struct Archive {
-    source: ArchiveSource,
+    source: OpenedSource,
+    /// Inode stamp for a single file. Split volumes use `VolumeChain` snapshots.
+    source_stamp: Option<SourceStamp>,
     volume_paths: Vec<PathBuf>,
     metadata: Metadata,
     password: Password,
@@ -120,6 +91,72 @@ pub struct Archive {
     index: BTreeMap<String, usize>,
     explicit_directories: HashSet<String>,
     cache: Option<(String, Vec<u8>)>,
+}
+
+/// Immutable source metadata detects changes across cached as well as uncached reads.
+/// This is not a snapshot guarantee for a concurrently modified NAS file.
+#[derive(PartialEq, Eq)]
+struct SourceStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, u64, i64, i64, i64, i64),
+}
+fn source_stamp(source: &File) -> Result<SourceStamp> {
+    let metadata = source.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("archive source must remain a regular file".into());
+    }
+    Ok(SourceStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        },
+    })
+}
+
+/// Portable in-memory decoder source contract; mounts use a supervised worker.
+pub trait ArchiveSource {
+    fn entries(&self) -> Vec<(String, Option<u64>)>;
+    fn read(&mut self, path: &str) -> Result<Vec<u8>>;
+    /// At most `length` bytes from `offset`; empty at or past the end. A
+    /// supervised worker slices in the child so a small read of a large
+    /// entry does not transfer the whole entry.
+    fn read_range(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        Ok(slice_range(self.read(path)?, offset, length))
+    }
+    fn revision_sha256(&mut self) -> Result<[u8; 32]>;
+}
+
+pub(crate) fn slice_range(mut data: Vec<u8>, offset: u64, length: usize) -> Vec<u8> {
+    if offset >= data.len() as u64 {
+        return Vec::new();
+    }
+    let start = offset as usize;
+    let end = start + length.min(data.len() - start);
+    data.truncate(end);
+    data.drain(..start);
+    data
+}
+
+fn copy_span(bytes: &[u8], offset: u64, length: usize) -> Vec<u8> {
+    if length == 0 || offset >= bytes.len() as u64 {
+        return Vec::new();
+    }
+    let start = offset as usize;
+    let end = start + length.min(bytes.len() - start);
+    bytes[start..end].to_vec()
 }
 
 /// Strict portable relative path policy. No URL decoding is performed here.
@@ -160,10 +197,10 @@ pub fn validate_archive_path(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn header_preflight(file: &mut ArchiveSource) -> Result<()> {
+fn header_preflight(file: &mut OpenedSource) -> Result<()> {
     let len = match file {
-        ArchiveSource::File(f) => f.metadata().map_err(|e| e.to_string())?.len(),
-        ArchiveSource::Volumes(chain) => chain.total_len(),
+        OpenedSource::File(f) => f.metadata().map_err(|e| e.to_string())?.len(),
+        OpenedSource::Volumes(chain) => chain.total_len(),
     };
     let mut header = [0; 32];
     file.read_exact(&mut header)
@@ -261,6 +298,19 @@ impl Archive {
         Self::open_volumes(&volumes, password, limits)
     }
 
+    /// Available only inside the dedicated supervised decoder child.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn open_worker(
+        path: impl AsRef<Path>,
+        password: &str,
+        limits: Limits,
+        permit: &crate::worker::WorkerPermit,
+    ) -> Result<Self> {
+        permit.verify()?;
+        let volumes = resolve_archive(path.as_ref())?;
+        Self::open_volumes(&volumes, password, limits)
+    }
+
     // Unit fixtures test parser semantics without changing the parallel test
     // harness's process-wide limits. This entry point does not exist in builds
     // used by applications; integration tests exercise the guarded public API.
@@ -278,9 +328,13 @@ impl Archive {
             return Err("memory limits exceed platform address size".into());
         }
         let mut source = if paths.len() == 1 {
-            ArchiveSource::open_single(&paths[0])?
+            OpenedSource::open_single(&paths[0])?
         } else {
-            ArchiveSource::Volumes(VolumeChain::open(paths)?)
+            OpenedSource::Volumes(VolumeChain::open(paths)?)
+        };
+        let source_stamp = match &source {
+            OpenedSource::File(file) => Some(source_stamp(file)?),
+            OpenedSource::Volumes(_) => None,
         };
         header_preflight(&mut source)?;
         let password = Password::new(password);
@@ -363,6 +417,7 @@ impl Archive {
         }
         Ok(Self {
             source,
+            source_stamp,
             volume_paths: paths.to_owned(),
             metadata,
             password,
@@ -375,36 +430,6 @@ impl Archive {
 
     pub fn volume_paths(&self) -> &[PathBuf] {
         &self.volume_paths
-    }
-
-    /// Hash the full opened archive, including its compressed payload and header.
-    /// Uses a fixed-size buffer and preserves the descriptor's current position.
-    /// Concurrent archive mutation is unsupported. Length/mtime checks catch
-    /// common changes during hashing, but do not make it an immutable snapshot.
-    pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
-        use sha2::{Digest, Sha256};
-        let (before_len, before_mtime) = self.source.metadata_snapshot()?;
-        let position = self.source.stream_position()?;
-        self.source
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| e.to_string())?;
-        let result = (|| {
-            let mut hash = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let count = self.source.read(&mut buffer).map_err(|e| e.to_string())?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-            }
-            self.source.verify_unchanged(before_len, before_mtime)?;
-            Ok(hash.finalize().into())
-        })();
-        self.source
-            .seek(SeekFrom::Start(position))
-            .map_err(|e| e.to_string())?;
-        result
     }
 
     /// Explicit directory records and their ancestors remain directories even
@@ -430,7 +455,7 @@ impl Archive {
         self.index.keys().cloned().collect()
     }
 
-    pub fn inspect(&self) -> String {
+    pub fn inspect_summary(&self) -> String {
         let mut report = format!(
             "Files: {}\nBlocks: {}\nSolid: {}\nLimits: request={} cache={} dictionary={} bytes; decoder threads=1\n",
             self.index.len(),
@@ -441,6 +466,11 @@ impl Archive {
             self.limits.max_dictionary_bytes
         );
         report.push_str("Solid blocks require decoding preceding bytes on cache misses; no whole-block RAM cache.\nEncoded-header allocation is guarded by the required host process limit, not these payload limits.\n");
+        report
+    }
+
+    pub fn inspect(&self) -> String {
+        let mut report = self.inspect_summary();
         for (i, block) in self.metadata.blocks.iter().enumerate() {
             let dictionary_bytes: u64 = block
                 .coders
@@ -467,13 +497,134 @@ impl Archive {
         report
     }
 
+    pub(crate) fn ensure_source_unchanged(&self) -> Result<()> {
+        match &self.source {
+            OpenedSource::File(file) => {
+                let Some(stamp) = &self.source_stamp else {
+                    return Err("archive source stamp missing".into());
+                };
+                if &source_stamp(file)? != stamp {
+                    return Err(
+                        "archive source changed after opening; reopen against a new revision"
+                            .into(),
+                    );
+                }
+            }
+            OpenedSource::Volumes(chain) => {
+                chain
+                    .volume_metadata_unchanged()
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn bounded_entries(
+        &self,
+        maximum: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<(String, Option<u64>)>> {
+        if self
+            .index
+            .len()
+            .saturating_add(self.explicit_directories.len())
+            > maximum
+        {
+            return Err("worker namespace entry limit exceeded".into());
+        }
+        let mut required = 36usize;
+        for name in self.index.keys().chain(self.explicit_directories.iter()) {
+            required = required
+                .checked_add(13usize.saturating_add(name.len()))
+                .ok_or("metadata overflow")?;
+        }
+        if required > byte_budget {
+            return Err("worker metadata byte limit exceeded".into());
+        }
+        Ok(self.entries())
+    }
+
+    /// Hash the whole already opened archive and verify it still has the same inode
+    /// metadata before and after. This binds local Upper state to one revision.
+    pub fn revision_sha256(&mut self) -> Result<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        self.ensure_source_unchanged()?;
+        let position = self.source.stream_position()?;
+        self.source
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            let mut hash = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = self.source.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&buffer[..count]);
+            }
+            self.ensure_source_unchanged()?;
+            Ok(hash.finalize().into())
+        })();
+        self.source
+            .seek(SeekFrom::Start(position))
+            .map_err(|e| e.to_string())?;
+        result
+    }
+
+    pub fn entries(&self) -> Vec<(String, Option<u64>)> {
+        let mut entries: Vec<_> = self
+            .explicit_directories
+            .iter()
+            .map(|name| (name.clone(), None))
+            .chain(
+                self.index
+                    .iter()
+                    .map(|(name, &idx)| (name.clone(), Some(self.metadata.files[idx].size))),
+            )
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>> {
         validate_archive_path(name)?;
+        self.ensure_source_unchanged()?;
         if let Some((key, bytes)) = &self.cache
             && key == name
         {
-            return Ok(bytes.clone());
+            let result = bytes.clone();
+            self.ensure_source_unchanged()?;
+            return Ok(result);
         }
+        let output = self.decode_entry(name)?;
+        if (output.len() as u64) <= self.limits.max_cache_bytes {
+            self.cache = Some((name.to_owned(), output.clone()));
+        }
+        Ok(output)
+    }
+
+    /// Bytes in `[offset, offset+length)`. A cache hit copies only that span.
+    pub fn read_range(&mut self, name: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        validate_archive_path(name)?;
+        self.ensure_source_unchanged()?;
+        if let Some((key, bytes)) = &self.cache
+            && key == name
+        {
+            let slice = copy_span(bytes, offset, length);
+            self.ensure_source_unchanged()?;
+            return Ok(slice);
+        }
+        let output = self.decode_entry(name)?;
+        let slice = copy_span(&output, offset, length);
+        if (output.len() as u64) <= self.limits.max_cache_bytes {
+            self.cache = Some((name.to_owned(), output));
+        }
+        Ok(slice)
+    }
+
+    fn decode_entry(&mut self, name: &str) -> Result<Vec<u8>> {
         let i = *self
             .index
             .get(name)
@@ -527,10 +678,23 @@ impl Archive {
             })
             .map_err(|e| format!("archive decode: {e}"))?;
         let output = output.ok_or("entry missing from block")?;
-        if size <= self.limits.max_cache_bytes {
-            self.cache = Some((name.to_owned(), output.clone()));
-        }
+        self.ensure_source_unchanged()?;
         Ok(output)
+    }
+}
+
+impl ArchiveSource for Archive {
+    fn entries(&self) -> Vec<(String, Option<u64>)> {
+        Archive::entries(self)
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+        Archive::read(self, path)
+    }
+    fn read_range(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>> {
+        Archive::read_range(self, path, offset, length)
+    }
+    fn revision_sha256(&mut self) -> Result<[u8; 32]> {
+        Archive::revision_sha256(self)
     }
 }
 
@@ -734,7 +898,7 @@ mod tests {
             .open(&path)
             .unwrap();
         file.set_len(32 + (9 << 20)).unwrap();
-        let mut source = ArchiveSource::File(file);
+        let mut source = OpenedSource::File(file);
         assert!(
             header_preflight(&mut source)
                 .unwrap_err()
@@ -776,7 +940,7 @@ mod tests {
         let expected: [u8; 32] = Sha256::digest(std::fs::read(&path).unwrap()).into();
         assert_eq!(revision, expected);
         assert_eq!(
-            ArchiveSource::stream_position(&mut archive.source).unwrap(),
+            OpenedSource::stream_position(&mut archive.source).unwrap(),
             7
         );
         assert_eq!(archive.read("data.json").unwrap(), b"hello archive");
@@ -827,6 +991,34 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("regular file")
+        );
+    }
+
+    #[test]
+    fn range_read_does_not_retain_a_full_entry_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("range.7z");
+        let mut writer = ArchiveWriter::create(&path).unwrap();
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("big.bin"), Some(payload.as_slice()))
+            .unwrap();
+        writer.finish().unwrap();
+        let mut archive = Archive::open_fixture(&path, "", Limits::default()).unwrap();
+        for _ in 0..3 {
+            let part = archive.read_range("big.bin", 100, 16).unwrap();
+            assert_eq!(part, payload[100..116]);
+            assert!(
+                part.capacity() < 4096,
+                "range read kept a full-entry buffer (capacity {})",
+                part.capacity()
+            );
+        }
+        assert_eq!(
+            archive
+                .read_range("big.bin", payload.len() as u64, 8)
+                .unwrap(),
+            Vec::<u8>::new()
         );
     }
 }

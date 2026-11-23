@@ -1,17 +1,27 @@
-name: Rust core
+name: Rust core and playability probe
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
   linux-core:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Install user-space FUSE
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev fuse
+      - run: cargo clippy --locked --all-targets --features fuse -- -D warnings
+      - run: cargo test --locked --features fuse
+      - run: cargo build --locked --features fuse
+      - name: Conditional real mount smoke (explicit skip if no device)
+        run: python3 scripts/test_mount_smoke.py
       - run: cargo build --release --locked
       - name: Official 7-Zip interoperability
         env:
@@ -25,3 +35,16 @@ jobs:
           chmod +x /tmp/7zz
           python3 scripts/test_7zip_interop.py /tmp/7zz
           cargo test --locked --test split_volumes
+  macos-worker:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Acceptance boundary
+        run: echo 'Native decoder and library tests only. macFUSE adapter, extension activation, actual macOS mounts, NW.js GUI and gameplay are NOT verified by this job.'

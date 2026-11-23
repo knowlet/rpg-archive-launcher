@@ -1,2 +1,4 @@
 /target/
 *.wal
+__pycache__/
+probe-report.json

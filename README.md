@@ -1,8 +1,14 @@
 # rpg-archive-launcher
 
+> This branch adds an experimental supervised decoder, read-only FUSE adapter,
+> independent save-prefix Upper API, and explicit NW.js directory launch.
+> See [macOS probe and acceptance limits](docs/macos-playability.md).
+> Real macOS mounts, NW.js gameplay, and mounted saves are not yet accepted.
+> The core-command description below remains applicable to the original CLI.
+
 An experimental Rust core for reading encrypted 7z RPG Maker resources in memory and keeping user changes in a durable, separate local Upper store.
 
-**Status: CLI play preparation + overlay repairs; no filesystem mount or NW.js execution yet.** Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
+**Status: Linux CLI play preparation, overlay repairs, and an optional read-only FUSE probe.** `play` does not mount or launch NW.js. Real macOS mounts and NW.js gameplay are not accepted. Linux tests do not establish macOS FSKit or Windows WinFsp compatibility.
 
 ## Friendly play entry (Linux CLI)
 
@@ -81,13 +87,13 @@ Encrypted archives accept a single UTF-8 password line via stdin with `--passwor
 ## Planned acceptance gates
 
 1. Benchmark cold/warm solid block reads, decode amplification and peak RSS against official 7-Zip fixtures.
-2. Linux FUSE adapter, with ordinary file operations and runtime lifecycle tests.
+2. Accepted Linux FUSE gameplay, beyond the optional read-only `mount-ro` probe.
 3. macOS Apple Silicon FSKit/macFUSE probe and actual MV/MZ play/save/reopen tests.
 4. Persistent save snapshots, conflict branches, interrupted-operation recovery and opt-in validated archive commit.
 5. Independent Windows WinFsp semantics and playability tests.
 6. Tauri management UI, isolated from game content.
 
-This environment has no `/dev/fuse`, NW.js install or macOS/Windows host. Mounting and playability have not been tested. `play` prepares overlay state only. See [design notes](docs/architecture.md).
+Real macOS mounts, NW.js gameplay, and hosts without `/dev/fuse` are unverified. `play` prepares overlay state only. Optional `mount-ro` is a read-only probe. See [design notes](docs/architecture.md) and [the macOS probe limits](docs/macos-playability.md).
 
 ## License
 

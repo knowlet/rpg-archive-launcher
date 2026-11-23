@@ -3,18 +3,25 @@ name = "rpg-archive-launcher"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
-description = "Experimental memory-only 7z resource reader and durable save overlay for RPG Maker games"
+description = "Experimental supervised 7z virtual filesystem and NW.js playability probe"
 license = "Apache-2.0"
+
+[features]
+default = []
+fuse = []
 
 [dependencies]
 sevenz-rust2 = { version = "=0.24.0", default-features = false, features = ["aes256", "compress"] }
-fs2 = "0.4"
 libc = "0.2"
 sha2 = "0.11"
 getrandom = "0.4"
 unicode-normalization = "0.1"
 regex = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
